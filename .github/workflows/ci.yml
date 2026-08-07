@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # Make uv use the interpreter that actions/setup-python installed instead
+      # of downloading one of its own.
+      UV_PYTHON_PREFERENCE: only-system
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - python-version: "3.10"
+          toxenv: min
+        - python-version: "3.10"
+        - python-version: "3.11"
+        - python-version: "3.12"
+        - python-version: "3.13"
+        - python-version: "3.14"
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Set up uv
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      with:
+        cache-dependency-glob: |
+          pyproject.toml
+          tox.ini
+    - name: tox
+      run: uvx --with tox-uv tox -e ${{ matrix.toxenv || 'py' }}
+
+  check:
+    runs-on: ubuntu-latest
+    env:
+      UV_PYTHON_PREFERENCE: only-system
+    strategy:
+      fail-fast: false
+      matrix:
+        toxenv: [pre-commit, twinecheck]
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Set up Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: "3.13"
+    - name: Set up uv
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      with:
+        cache-dependency-glob: |
+          pyproject.toml
+          tox.ini
+          .pre-commit-config.yaml
+    - name: tox
+      run: uvx --with tox-uv tox -e ${{ matrix.toxenv }}
