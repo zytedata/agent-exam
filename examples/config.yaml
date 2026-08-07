@@ -1,0 +1,73 @@
+# Example `evals/config.yaml`. Every key is optional; the defaults below are
+# the ones agent-exam applies when a key is absent.
+
+# Harness used when a run does not pass --provider.
+default_harness: claude_code
+
+# Where the skills under evaluation live. Each entry is staged into the
+# attempt's working directory before the agent starts. Defaults to `./skills`
+# when that directory exists, so most projects can omit this. A repo that has
+# to *build* its skills first can point
+# `pyproject.toml [tool.agent-exam] pre_run_hook` at a callable returning
+# `PreRunResult(skills_dirs=[...])`, which overrides whatever is set here.
+skills_dirs:
+  - ./skills
+
+providers:
+  claude_code:
+    default_model: claude-sonnet-4-6
+    judge_model: claude-haiku-4-5
+    model_aliases:
+      sonnet: claude-sonnet-4-6
+      haiku: claude-haiku-4-5
+    extra_args: []
+    # Run agent calls non-interactively — permission prompts would block
+    # subprocess evals indefinitely. `auto` lets Claude decide per-action
+    # (matches the Claude Code UX). Tasks can override with their own
+    # `permission_mode:` — e.g. `bypassPermissions` for a task that must
+    # run shell commands unattended, or `default` to test the approval
+    # UX explicitly. Claude Code's modes: auto, bypassPermissions,
+    # acceptEdits, dontAsk, default, plan.
+    permission_mode: auto
+    # Plugins that ship skills with the same names as the ones staged from
+    # `skills_dirs`. Claude Code loads user-enabled plugins additively, so a
+    # plugin copy would load alongside the staged copy and `--without-skill`
+    # could not exclude it. Listing it here turns that into a loud warning.
+    blocked_plugins:
+      - my-skills-plugin
+
+  codex_cli:
+    default_model: gpt-5.5
+    judge_model: gpt-5.4-mini
+    # Codex's workspace-write sandbox denies uv its default home-dir
+    # locations, which both litters trajectories with permission_denied
+    # calls (tripping no_permission_errors) and burns agent turns on
+    # workarounds. The cache is content-addressed and safe to share;
+    # ~/.local/share/uv holds the tool environments uvx installs into.
+    writable_roots:
+      - "~/.cache/uv"
+      - "~/.local/share/uv"
+    # Skills that run scripts with PEP 723 inline dependencies need PyPI at
+    # run time, and the other harnesses run with full network anyway, so
+    # Codex's network-off default would only make its runs artificially
+    # stricter. Tasks that deliberately test offline behavior can set
+    # `codex_cli: {network_access: false}`.
+    network_access: true
+
+  copilot_cli:
+    default_model: claude-sonnet-4.6
+    judge_model: gpt-5-mini
+
+  opencode:
+    judge_model: opencode-go/minimax-m2.5
+    pure: true
+
+judge:
+  timeout_seconds: 60
+
+default_task_timeout_seconds: 300
+
+# Caps parallel attempts for tasks tagged with the same group — for tasks
+# that share a rate-limited external service.
+concurrency_groups:
+  my_api: 1

@@ -1,0 +1,8 @@
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # The central governance workflow is called at @main by design, so a
+        # service repo cannot pin its secrets scan to an older revision.
+        "zytedata/governance/*": ref-pin
+        "*": hash-pin
