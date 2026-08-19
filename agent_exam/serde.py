@@ -144,4 +144,5 @@ def run_result_from_artifacts(attempt_json: dict, trajectory_json: dict) -> RunR
         trajectory=trajectory,
         metrics=metrics,
         raw_transcript_path=raw_path,
+        mcp_server_status=attempt_json.get("mcp_server_status"),
     )

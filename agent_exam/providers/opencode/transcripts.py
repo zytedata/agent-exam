@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...mcp import canonicalize_tool_names
 from ...schemas import (
     Metrics,
     RunResult,
@@ -16,6 +17,7 @@ from ...schemas import (
     ToolCallBlock,
     Turn,
 )
+from ...trajectory_walk import record_detected_tool
 
 if TYPE_CHECKING:
     from ..base import Provider
@@ -46,6 +48,7 @@ def build_run_result(
     state: StreamState,
     wall_time_seconds: float,
     stream_detected_skill: SkillInvocation | None = None,
+    stream_detected_tool: str | None = None,
     raw_transcript_path: Path | None = None,
     user_prompt: str | None = None,
 ) -> RunResult:
@@ -62,7 +65,13 @@ def build_run_result(
     trajectory, subagent_session_map = _build_trajectory(
         events, user_prompt=user_prompt
     )
+    if stream_detected_tool is not None:
+        record_detected_tool(trajectory, stream_detected_tool)
     subagent_metrics = _attach_subagents(trajectory, subagent_session_map)
+    # OpenCode reports an MCP call as one `<server>_<tool>` string and
+    # nothing else, so the server has to be matched back out of it. After
+    # the subagent turns are in, so their calls are named the same way.
+    canonicalize_tool_names(trajectory, state.mcp_server_names)
     skill_invocations = _extract_skill_invocations(
         trajectory, stream_detected_skill, state.provider
     )
@@ -80,6 +89,7 @@ def build_run_result(
         metrics=metrics,
         raw_transcript_path=raw_transcript_path,
         model=actual_model,
+        mcp_server_status=state.mcp_server_status,
     )
 
 

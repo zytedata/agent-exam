@@ -111,7 +111,7 @@ positive: [a]
     assert task.fixture is None
 
 
-def test_trigger_rejects_missing_skill(tmp_path):
+def test_trigger_rejects_missing_target(tmp_path):
     path = _write(
         tmp_path,
         """
@@ -119,7 +119,7 @@ kind: trigger
 positive: [hi]
 """,
     )
-    with pytest.raises(UsageError, match=r"skill.*Field required"):
+    with pytest.raises(UsageError, match="exactly one of"):
         load_task(path, suite="s")
 
 

@@ -30,6 +30,10 @@ Top-level fields
     Labels suites and tasks may wear, and which of them are skipped by
     default. See :ref:`tags` below.
 
+``mcp_servers``
+    MCP servers to attach to the agent under evaluation. See
+    :ref:`mcp-servers` below.
+
 ``providers``
     Per-harness configuration blocks. See :ref:`providers` below.
 
@@ -287,6 +291,67 @@ What a run does with a default-excluded tag depends on how narrowly it asked:
 
 ``--tag``, ``--exclude-tag`` and ``--all-tags`` override all of it — see
 :doc:`cli`.
+
+.. _mcp-servers:
+
+``mcp_servers``
+===============
+
+MCP servers attached to the agent under evaluation — for skills that depend on
+one, and for evaluating a server's own tools and descriptions. Each entry is
+the standard MCP JSON, so a block copies over from the server's README:
+
+.. code-block:: yaml
+
+    mcp_servers:
+      files:
+        command: mcp-files
+        args: ["--root", "."]
+        env:
+          FILES_TOKEN: "${FILES_TOKEN}"
+      tickets:
+        type: http
+        url: https://tickets.example.com/mcp
+        headers:
+          Authorization: "Bearer ${TICKETS_TOKEN}"
+
+A remote server needs only its ``url``; ``type`` is ``http`` unless the server
+speaks ``sse``.
+
+``${VAR}`` in an ``env`` or ``headers`` value is substituted from the
+environment agent-exam itself runs in, so credentials stay out of the file. A
+variable that is not set fails the run at its start, before any trial — only
+for the servers that run's tasks attach, so a credential is needed by the runs
+that use it and not by every run.
+
+``codex_cli`` sends no header of its own — it reads a bearer token out of the
+environment at launch — so ``Authorization: "Bearer ${VAR}"`` is the only
+header it can carry, and a server needing any other has to be scoped away from
+it with ``providers:``.
+
+Tasks attach every configured server unless they name a subset with their own
+``mcp_servers:`` — see :doc:`task-yaml`. Definitions belong here rather than in
+a task file because reports serialize task files verbatim.
+
+Runs are hermetic: the servers configured here are the only ones the agent
+sees, and the ones set up in the developer's own harness config are left out.
+
+A per-task ``allowed_tools`` allowlist covers every attached server on its
+own, since a list that named only native tools would deny the tools the task
+is about.
+
+A server that fails to connect leaves the agent silently without its tools, so
+an attempt whose harness reports one is an ``error`` rather than a graded
+result. The statuses land in the attempt's :file:`attempt.json`. ``claude_code``,
+``copilot_cli`` and ``opencode`` each report them; ``codex_cli`` reports
+nothing, and under it a server that never came up surfaces as the task
+failing.
+
+Assertions grade MCP tool calls through the ordinary ``tool_called``,
+``tool_not_called`` and ``tool_count`` types, naming the tool as
+``mcp__<server>__<tool>`` whichever harness ran, so a server name is limited
+to letters, digits, ``-`` and ``_``, the last of which can neither be doubled
+nor sit at either end.
 
 A full example
 ==============

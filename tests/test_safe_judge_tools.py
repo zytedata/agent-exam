@@ -89,6 +89,17 @@ def test_permission_config_preserves_user_external_directory_override():
     assert out["external_directory"] == "allow"
 
 
+def test_permission_config_adds_mcp_wildcards_even_with_explicit_permission():
+    """An explicit `permission:` override must not leave an attached MCP
+    server to whatever that override's own default does to it — OpenCode's
+    `ask` default would hang a headless run waiting for approval."""
+    out = build_permission_config(
+        permission={"bash": "allow"}, allowed_tools=None, mcp_servers=["files"]
+    )
+    assert out["files*"] == "allow"
+    assert out["bash"] == "allow"
+
+
 def test_permission_config_empty_when_nothing_provided():
     """No permission and no allowed_tools → still get the forced
     external_directory deny."""

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -15,7 +16,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from pydantic import BaseModel, field_validator
 
 from ..._models import _StrictModel
+from ...config import McpHttpServer
 from ...errors import FrameworkError, ProviderTimeout, UsageError
+from ...mcp import resolve_servers
 from ...ratelimit import with_retries
 from ...schemas import CheckResult, RunResult
 from ..base import Provider
@@ -28,6 +31,7 @@ from .stream_parser import (
     drain_stderr,
     drain_stream,
     stream_error_messages,
+    strip_path_alias_warning,
 )
 from .transcripts import build_run_result, find_session_explicit_skill_invocation
 
@@ -74,6 +78,11 @@ class CodexCliProvider(Provider):
     safe_judge_tools = ("command_execution",)
     omitted_model_label = "Codex CLI default model"
     task_config_model: ClassVar[type[BaseModel]] = CodexCliTaskConfig
+    supports_mcp: ClassVar[bool] = True
+    # `codex exec --json`'s event stream has no session-level event for MCP
+    # server startup/connection status (only per-call `mcp_tool_call` items
+    # once the agent actually invokes one) — see `Provider.reports_mcp_connections`.
+    reports_mcp_connections: ClassVar[bool] = False
 
     def task_options(
         self, task_cfg: CodexCliTaskConfig | None, framework_cfg, task_kind: str
@@ -132,7 +141,14 @@ class CodexCliProvider(Provider):
     ) -> RunResult:
         provider_options = self._prepare_prefix_rules(cwd, provider_options)
         cmd = self._build_cmd(prompt, model, cwd, provider_options)
-        env = build_child_env(provider_options.get("env_overrides"))
+        env_overrides = provider_options.get("env_overrides")
+        staged_home = provider_options.get("codex_home")
+        if staged_home:
+            # Wins over a task's own `env: {CODEX_HOME: ...}`: that staged
+            # home is where `stage_mcp_config` just wrote the MCP config,
+            # and it's what makes `--ignore-user-config` skippable below.
+            env_overrides = {**(env_overrides or {}), "CODEX_HOME": staged_home}
+        env = build_child_env(env_overrides)
 
         cwd_abs = cwd.resolve()
         raw_dir = cwd_abs.parent / ".raw_streams" / cwd_abs.name
@@ -155,6 +171,7 @@ class CodexCliProvider(Provider):
         state = StreamState()
         if stop_on_first_skill:
             state.skill_detection_enabled = True
+            state.target_tool = provider_options.get("target_tool")
             state.negative_trigger_mode = bool(provider_options.get("negative_trigger"))
 
         t_out = threading.Thread(
@@ -214,9 +231,9 @@ class CodexCliProvider(Provider):
             )
 
         if process.returncode != 0 and not killed_on_skill:
-            stderr_tail = (
-                bytes(state.stderr_tail).decode("utf-8", errors="replace").strip()
-            )
+            stderr_tail = strip_path_alias_warning(
+                bytes(state.stderr_tail).decode("utf-8", errors="replace")
+            ).strip()
             # The reason for a fatal exit (auth failure, usage limit, …)
             # arrives as error events on the JSON stream; stderr is
             # typically just noise. Quote the stream errors, and rescue
@@ -235,6 +252,7 @@ class CodexCliProvider(Provider):
             state,
             wall_time_seconds=wall_time,
             stream_detected_skill=state.detected_skill,
+            stream_detected_tool=state.detected_tool,
             raw_transcript_path=raw_path,
             user_prompt=prompt,
             model=model,
@@ -308,7 +326,11 @@ class CodexCliProvider(Provider):
 
         cmd.append("exec")
         cmd.extend(["--json", "--color", "never", "--skip-git-repo-check"])
-        if provider_options.get("ignore_user_config", True):
+        # A staged CODEX_HOME (see `stage_mcp_config`) holds only the
+        # config.toml this run wrote, which codex has to load to find its
+        # MCP servers.
+        staged_home = provider_options.get("codex_home")
+        if provider_options.get("ignore_user_config", True) and not staged_home:
             cmd.append("--ignore-user-config")
         if provider_options.get("ignore_rules", True):
             cmd.append("--ignore-rules")
@@ -319,6 +341,47 @@ class CodexCliProvider(Provider):
         cmd.append("--")
         cmd.append(prompt)
         return cmd
+
+    def stage_mcp_config(self, run_tmp_root: Path, cfg, servers=None) -> dict:
+        """Render the servers into the `mcp_servers` table of a
+        :file:`config.toml` under a staged ``CODEX_HOME``, and point the
+        attempt at it. Codex takes configuration either from that file or from
+        `-c` overrides on its command line, and a server's ``env`` holds
+        credentials, which argv would expose to any local process through
+        ``ps``.
+        """
+        table: dict[str, dict] = {}
+        for name, server in resolve_servers(cfg, servers).items():
+            if "url" not in server:
+                table[name] = {
+                    k: v for k, v in server.items() if k in ("command", "args", "env")
+                }
+                continue
+            problem = _codex_http_problem(name, cfg.mcp_servers[name])
+            if problem is not None:
+                raise UsageError(problem)
+            table[name] = {"url": server["url"]}
+            headers = cfg.mcp_servers[name].headers
+            if headers:
+                table[name]["bearer_token_env_var"] = _bearer_header_var(headers)
+        if not table:
+            return {}
+        return {
+            "codex_home": str(_stage_codex_home(run_tmp_root, table)),
+            "mcp_server_names": sorted(table),
+        }
+
+    def validate_mcp_servers(self, servers: dict) -> list[str]:
+        """Reject a ``type: sse`` or non-bearer HTTP server before the run
+        starts, rather than only when the first codex_cli attempt stages it.
+        """
+        problems = []
+        for name, server in servers.items():
+            if isinstance(server, McpHttpServer):
+                problem = _codex_http_problem(name, server)
+                if problem is not None:
+                    problems.append(problem)
+        return problems
 
     def _prepare_prefix_rules(self, cwd: Path, provider_options: dict) -> dict:
         prefix_rules = provider_options.get("prefix_rules")
@@ -468,6 +531,30 @@ class CodexCliProvider(Provider):
         stage_skills_into(run_tmp_root, cfg.skills_dirs, exclude=skills_to_exclude)
 
 
+def _stage_codex_home(run_tmp_root: Path, mcp_servers: dict[str, dict]) -> Path:
+    """Build a ``CODEX_HOME`` holding this run's MCP servers, plus a copy of
+    the developer's :file:`auth.json` — codex resolves credentials from
+    ``CODEX_HOME`` too, and a copy leaves their own file untouched by a token
+    refresh mid-attempt.
+
+    A home of its own is also what leaves nothing of the developer's codex
+    config in reach of the trial, the job ``--ignore-user-config`` does for
+    every other run.
+    """
+    home = run_tmp_root / f"codex-home-{uuid.uuid4().hex[:12]}"
+    home.mkdir(parents=True, exist_ok=True)
+    lines = ["[mcp_servers]"]
+    lines += [
+        f"{_toml_key(name)} = {_toml_value(server)}"
+        for name, server in mcp_servers.items()
+    ]
+    (home / "config.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    auth = codex_home() / "auth.json"
+    if auth.is_file():
+        shutil.copy2(auth, home / "auth.json")
+    return home
+
+
 def _render_prefix_rules(rules: list[dict]) -> str:
     chunks: list[str] = []
     for rule in rules:
@@ -593,6 +680,43 @@ def _preserve_failed_stream(raw_path: Path) -> Path:
         return target
     except OSError:
         return raw_path
+
+
+_BEARER_ENV_REF = re.compile(r"^Bearer\s+\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def _bearer_header_var(headers: dict[str, str]) -> str | None:
+    """The variable an ``Authorization: Bearer ${VAR}`` header reads, or
+    ``None`` when *headers* isn't shaped exactly that way.
+    """
+    auth = next((v for k, v in headers.items() if k.lower() == "authorization"), None)
+    match = _BEARER_ENV_REF.match(auth or "")
+    if match is None or len(headers) > 1:
+        return None
+    return match.group(1)
+
+
+def _codex_http_problem(name: str, server: McpHttpServer) -> str | None:
+    """What keeps codex_cli from attaching HTTP *server* config as declared.
+
+    Codex speaks streamable HTTP only, not classic SSE. It also sends no
+    header of its own; it authenticates by reading a bearer token out of a
+    named environment variable at launch, so it wants *headers* as written
+    rather than resolved, and any header shape other than a single
+    ``Authorization: Bearer ${VAR}`` has nowhere to go.
+    """
+    if server.type == "sse":
+        return (
+            f"mcp_servers.{name}: codex_cli has no sse transport, only streamable http"
+        )
+    if server.headers and _bearer_header_var(server.headers) is None:
+        return (
+            f"mcp_servers.{name}: codex_cli passes no HTTP header other than "
+            'an `Authorization: "Bearer ${VAR}"` it reads from the '
+            "environment; scope the task with `providers:` to leave codex_cli "
+            "out of it"
+        )
+    return None
 
 
 def _toml_key(value: str) -> str:

@@ -60,6 +60,7 @@ def _run_cmd(
     n_parallel: int,
     without_skill: bool,
     no_skills: bool,
+    no_mcp: bool,
     no_triggers: bool,
     tags: tuple[str, ...] = (),
     exclude_tags: tuple[str, ...] = (),
@@ -75,6 +76,7 @@ def _run_cmd(
         n_parallel=n_parallel,
         without_skill=without_skill,
         no_skills=no_skills,
+        no_mcp=no_mcp,
         no_triggers=no_triggers,
         tags=list(tags),
         exclude_tags=list(exclude_tags),
@@ -255,11 +257,16 @@ def doctor_cmd(no_llm: bool, provider: str | None) -> None:
     help="Reality-check mode: drop every skill, not just the suite's.",
 )
 @click.option(
+    "--no-mcp",
+    is_flag=True,
+    help="Reality-check mode: attach none of the configured MCP servers.",
+)
+@click.option(
     "--no-triggers",
     is_flag=True,
     help="Skip 'kind: trigger' tasks — run only execute tasks. "
-    "Implied by the reality-check modes; pass it on the with-skill run to "
-    "compare like for like.",
+    "Implied by the skill-withholding modes; pass it on the with-skill run "
+    "to compare like for like.",
 )
 @click.option(
     "--tag",
@@ -288,6 +295,7 @@ def run_cmd(
     n_parallel: int,
     without_skill: bool,
     no_skills: bool,
+    no_mcp: bool,
     no_triggers: bool,
     tags: tuple[str, ...],
     exclude_tags: tuple[str, ...],
@@ -301,6 +309,7 @@ def run_cmd(
         n_parallel,
         without_skill,
         no_skills,
+        no_mcp,
         no_triggers,
         tags=tags,
         exclude_tags=exclude_tags,

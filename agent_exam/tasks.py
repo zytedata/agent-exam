@@ -95,6 +95,9 @@ class Task:
     # Trigger-kind fields. Default values keep execute tasks unchanged.
     stop_on_first_skill: bool = False
     target_skill: str | None = None
+    # Set instead of `target_skill` when the trigger is about a tool — an
+    # MCP one, typically — rather than a skill.
+    target_tool: str | None = None
     should_trigger: bool | None = None
     # Provider-specific task-config sections. Keyed by provider name;
     # value is a typed pydantic model — each provider's `task_config_model`
@@ -108,6 +111,10 @@ class Task:
     # `exclude_by_default` keeps the task out of a wide run — see
     # `select_by_tags`.
     tags: list[str] = field(default_factory=list)
+    # Which of the servers declared under `mcp_servers:` in config.yaml to
+    # attach. `None` attaches all of them, the way `skills_dirs` stages
+    # every skill; an empty list attaches none.
+    mcp_servers: list[str] | None = None
 
 
 # --- Pydantic task-file schema --------------------------------------------
@@ -143,6 +150,7 @@ class _TaskCommonModel(_StrictModel):
     timeout_seconds: PositiveNumber | None = None
     concurrency_group: str | None = None
     tags: list[str] = Field(default_factory=list)
+    mcp_servers: list[str] | None = None
     # Provider task-config sections — each provider owns its own schema
     # (`<Provider>.task_config_model`). Pydantic validates each present
     # section directly when constructing the Task model.
@@ -196,16 +204,26 @@ class _ExecuteTaskModel(_TaskCommonModel):
 
 class _TriggerTaskModel(_TaskCommonModel):
     kind: Literal["trigger"] = "trigger"
-    skill: str
+    skill: str | None = None
+    tool: str | None = None
     positive: list[str] = Field(default_factory=list)
     negative: list[str] = Field(default_factory=list)
 
-    @field_validator("skill")
+    @field_validator("skill", "tool")
     @classmethod
-    def _non_empty_skill(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("trigger task must declare 'skill: <name>'")
+    def _non_empty_target(cls, v: str | None) -> str | None:
+        if v is not None and not v.strip():
+            raise ValueError("must be a non-empty string")
         return v
+
+    @model_validator(mode="after")
+    def _exactly_one_target(self) -> _TriggerTaskModel:
+        if bool(self.skill) == bool(self.tool):
+            raise ValueError(
+                "trigger task must declare exactly one of 'skill: <name>' "
+                "or 'tool: <name>'"
+            )
+        return self
 
     @field_validator("positive", "negative", mode="before")
     @classmethod
@@ -331,6 +349,7 @@ def _task_from_execute(m: _ExecuteTaskModel, path: Path, suite: str, raw: dict) 
         source_path=path,
         provider_configs=m._provider_configs(),
         known_issue=m.known_issue,
+        mcp_servers=m.mcp_servers,
     )
 
 
@@ -341,16 +360,23 @@ def _tasks_from_trigger(
 
     provider_configs = m._provider_configs()
 
+    if m.tool:
+        target = m.tool
+        synth_types = ("first_tool", "tool_not_called")
+    else:
+        target = m.skill
+        synth_types = ("first_skill", "skill_not_invoked")
+
     def _emit(prompt: str, should_trigger: bool, idx: int) -> Task:
-        synth_type = "first_skill" if should_trigger else "skill_not_invoked"
+        synth_type = synth_types[0] if should_trigger else synth_types[1]
         # Build the typed config the YAML-load path produces, so `_eval`
         # doesn't need a separate code path for trigger-synthesized
         # assertions.
         synthesized = [
             Assertion(
                 type=synth_type,
-                config=m.skill,
-                parsed_config=parse_assertion_config(synth_type, m.skill),
+                config=target,
+                parsed_config=parse_assertion_config(synth_type, target),
             )
         ]
         return Task(
@@ -371,8 +397,10 @@ def _tasks_from_trigger(
             source_path=path,
             stop_on_first_skill=True,
             target_skill=m.skill,
+            target_tool=m.tool,
             should_trigger=should_trigger,
             provider_configs=provider_configs,
+            mcp_servers=m.mcp_servers,
         )
 
     results: list[Task] = []

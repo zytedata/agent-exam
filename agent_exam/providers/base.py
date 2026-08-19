@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
     from pydantic import BaseModel
 
-    from ..config import Config
+    from ..config import Config, McpServerConfig
     from ..schemas import CheckResult, RunResult
 
 
@@ -47,6 +47,22 @@ class Provider:
     #: harness's native casing. Providers whose native permission model
     #: is not an allowlist should override :meth:`judge_agent_options`.
     safe_judge_tools: tuple[str, ...] = ()
+
+    supports_mcp: ClassVar[bool] = False
+    """Whether this harness can attach MCP servers, i.e. whether it
+    overrides :meth:`stage_mcp_config`. Kept as a flag so the preflight
+    can ask without importing the provider registry, which imports every
+    provider, which imports the module the preflight lives in.
+    """
+
+    reports_mcp_connections: ClassVar[bool] = True
+    """Whether this harness announces per-server MCP connection status at
+    session start (see :func:`agent_exam.mcp.connection_check`). Meaningless
+    when :attr:`supports_mcp` is ``False``. A harness whose event stream
+    carries no such signal overrides this to ``False`` so
+    :func:`agent_exam.mcp.preflight` can say so, rather than a dead server
+    reading as a plain task failure with no indication why.
+    """
 
     #: Human-readable model source used when ``invoke(..., model="")``
     #: intentionally omits the provider's model flag. ``None`` means doctor
@@ -143,7 +159,8 @@ class Provider:
         with other skills and tools.
 
         Cross-cutting options (env_overrides, extra_args, target_skill,
-        negative_trigger) are pool.py's concern, not this method's.
+        target_tool, negative_trigger) are pool.py's concern, not this
+        method's.
 
         Default: no per-provider options.
         """
@@ -168,3 +185,35 @@ class Provider:
             self.skills_rel_path,
             exclude=skills_to_exclude,
         )
+
+    def stage_mcp_config(
+        self,
+        run_tmp_root: Path,
+        cfg: Config,
+        servers: list[str] | None = None,
+    ) -> dict:
+        """Attach the configured MCP servers and return the provider options
+        that do it — merged into the dict :meth:`invoke` consumes.
+
+        *servers* names the subset of ``cfg.mcp_servers`` this task wants;
+        ``None`` means all of them. Any file a harness needs is rendered
+        under *run_tmp_root*, which is the parent of the attempt's cwd —
+        never inside it, since the cwd is archived into the run's artifacts
+        and a server block can hold a credential.
+
+        The default attaches nothing, so a harness without MCP support needs
+        no code; :py:func:`agent_exam.mcp.preflight` warns when a run
+        configures servers such a harness will ignore.
+        """
+        return {}
+
+    def validate_mcp_servers(self, servers: dict[str, McpServerConfig]) -> list[str]:
+        """Provider-specific static checks on the MCP *servers* a run
+        attaches, beyond what :py:func:`agent_exam.mcp.preflight` already
+        checks generically. Return one problem description per server this
+        harness cannot actually attach as configured, so it surfaces before
+        the agent runs instead of when the first attempt stages it.
+
+        Default: no extra constraints.
+        """
+        return []
