@@ -306,7 +306,7 @@ def test_invoke_failure_reports_stream_errors_and_preserves_raw(monkeypatch, tmp
             model="",
             cwd=cwd,
             provider_options={},
-            stop_on_first_skill=False,
+            stop_on_first_trigger=False,
             timeout_seconds=30,
         )
 

@@ -8,7 +8,7 @@ Two regexes cover both paths Claude Code surfaces a skill invocation:
 The transcript walker (providers/transcripts.py) inspects finalized
 ToolCallBlock instances; the stream reader (providers/stream_parser.py)
 runs the same regexes against partial `input_json_delta` fragments so
-`stop_on_first_skill` can kill the subprocess before the tool executes.
+`stop_on_first_trigger` can kill the subprocess before the tool executes.
 """
 
 from __future__ import annotations

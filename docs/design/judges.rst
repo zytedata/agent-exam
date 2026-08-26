@@ -67,7 +67,7 @@ transcript or the working directory.
    * - A file got created
      - ``file_exists``
    * - A tool was or was not called
-     - ``tool_called`` / ``tool_not_called`` / ``tool_count``
+     - ``tool_called`` / ``tool_not_called`` / ``tool_count`` / ``first_tool``
    * - A skill fired, or did not
      - ``first_skill`` / ``skill_invoked`` / ``skill_not_invoked``
    * - The attempt tripped no permission prompts

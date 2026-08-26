@@ -4,6 +4,7 @@ import json
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -11,6 +12,7 @@ from pydantic import BaseModel, field_validator
 
 from ..._models import _StrictModel
 from ...errors import FrameworkError, ProviderTimeout
+from ...mcp import probe_connection_check, resolve_servers
 from ...ratelimit import with_retries
 from ...schemas import CheckResult, RunResult
 from ..base import Provider
@@ -93,7 +95,7 @@ class OpenCodeProvider(Provider):
         model: str,
         cwd: Path,
         provider_options: dict,
-        stop_on_first_skill: bool,
+        stop_on_first_trigger: bool,
         timeout_seconds: int,
     ) -> RunResult:
         return with_retries(
@@ -102,7 +104,7 @@ class OpenCodeProvider(Provider):
                 model,
                 cwd,
                 provider_options,
-                stop_on_first_skill,
+                stop_on_first_trigger,
                 timeout_seconds,
             )
         )
@@ -113,7 +115,7 @@ class OpenCodeProvider(Provider):
         model: str,
         cwd: Path,
         provider_options: dict,
-        stop_on_first_skill: bool,
+        stop_on_first_trigger: bool,
         timeout_seconds: int,
     ) -> RunResult:
         cmd = ["opencode", "run", "--format", "json"]
@@ -126,16 +128,30 @@ class OpenCodeProvider(Provider):
         if agent:
             cmd.extend(["--agent", agent])
         cmd.extend(["--dir", str(cwd.resolve())])
+        if provider_options.get("mcp_config"):
+            # Whether each server connected is logged and nothing else
+            # reports it — not the JSON stream, not the exit code.
+            cmd.extend(["--print-logs", "--log-level", "INFO"])
         cmd.append(prompt)
 
         env = build_child_env()
         permission_config = build_permission_config(
             permission=provider_options.get("permission"),
             allowed_tools=provider_options.get("allowed_tools"),
+            mcp_servers=provider_options.get("mcp_server_names"),
         )
+        config: dict = {}
         if permission_config:
-            config = {"permission": permission_config}
+            config["permission"] = permission_config
+        if provider_options.get("mcp_config"):
+            config["mcp"] = provider_options["mcp_config"]
+        if config:
             env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
+        if provider_options.get("xdg_config_home"):
+            # OpenCode merges the developer's own ~/.config/opencode/opencode.json
+            # into OPENCODE_CONFIG_CONTENT rather than being replaced by it, so
+            # keeping the run hermetic means pointing it at an empty config dir.
+            env["XDG_CONFIG_HOME"] = str(provider_options["xdg_config_home"])
         # Overrides last, so a task can still replace anything set above.
         apply_env_overrides(env, provider_options.get("env_overrides"))
 
@@ -150,9 +166,13 @@ class OpenCodeProvider(Provider):
         )
 
         state = StreamState(provider=self)
-        if stop_on_first_skill:
+        # Needed whether or not the run is cut short: the trajectory is
+        # named after these too, not just the kill decision.
+        state.mcp_server_names = tuple(provider_options.get("mcp_server_names") or ())
+        if stop_on_first_trigger:
             state.skill_detection_enabled = True
             state.target_skill = provider_options.get("target_skill")
+            state.target_tool = provider_options.get("target_tool")
             state.negative_trigger_mode = bool(provider_options.get("negative_trigger"))
 
         # Open raw stream file before the reader thread starts so every
@@ -173,7 +193,7 @@ class OpenCodeProvider(Provider):
 
         timed_out = False
         killed_on_skill = False
-        if stop_on_first_skill:
+        if stop_on_first_trigger:
             killed_on_skill, timed_out = self._wait_with_skill_kill(
                 process, state, timeout_seconds
             )
@@ -225,9 +245,45 @@ class OpenCodeProvider(Provider):
             state,
             wall_time_seconds=wall_time,
             stream_detected_skill=state.detected_skill,
+            stream_detected_tool=state.detected_tool,
             raw_transcript_path=raw_path,
             user_prompt=prompt,
         )
+
+    def stage_mcp_config(self, run_tmp_root: Path, cfg, servers=None) -> dict:
+        """Translate the servers into OpenCode's own `mcp` config block,
+        which ships to the child through `OPENCODE_CONFIG_CONTENT`.
+        """
+        mcp: dict[str, dict] = {}
+        for name, server in resolve_servers(cfg, servers).items():
+            if "url" in server:
+                entry = {"type": "remote", "url": server["url"], "enabled": True}
+                if server.get("headers"):
+                    entry["headers"] = server["headers"]
+            else:
+                entry = {
+                    "type": "local",
+                    "command": [server["command"], *server.get("args", [])],
+                    "enabled": True,
+                }
+                if server.get("env"):
+                    entry["environment"] = server["env"]
+            mcp[name] = entry
+        if not mcp:
+            return {}
+        # OpenCode always merges ~/.config/opencode/opencode.json into the
+        # env-supplied config rather than being replaced by it, so a
+        # developer's own MCP servers would otherwise leak into every run.
+        # An isolated, empty XDG_CONFIG_HOME (see `_invoke_once`) keeps it
+        # out — rendered next to the attempt cwd, not inside it, like the
+        # MCP config itself.
+        xdg_config_home = run_tmp_root / f"{uuid.uuid4().hex[:12]}.opencode-config"
+        xdg_config_home.mkdir(parents=True, exist_ok=True)
+        return {
+            "mcp_config": mcp,
+            "mcp_server_names": sorted(mcp),
+            "xdg_config_home": xdg_config_home,
+        }
 
     def _wait_with_skill_kill(
         self, process: subprocess.Popen, state: StreamState, timeout_seconds: int
@@ -311,7 +367,9 @@ class OpenCodeProvider(Provider):
     def probe_checks(self, probe_result, cfg=None) -> list[CheckResult]:
         from .doctor_probes import check_probe_model
 
-        return [check_probe_model(probe_result)]
+        results = [check_probe_model(probe_result)]
+        results.extend(probe_connection_check(probe_result, cfg))
+        return results
 
     def pre_run_warnings(self, cfg=None) -> list[CheckResult]:
         return []
@@ -323,7 +381,10 @@ _BARE_DENY_HANG_TOOLS = frozenset({"bash", "edit", "write", "read"})
 
 
 def build_permission_config(
-    *, permission: dict | None, allowed_tools: list[str] | tuple[str, ...] | None
+    *,
+    permission: dict | None,
+    allowed_tools: list[str] | tuple[str, ...] | None,
+    mcp_servers: list[str] | tuple[str, ...] | None = None,
 ) -> dict:
     """Compose the OpenCode `permission` mapping for one invocation.
 
@@ -337,12 +398,22 @@ def build_permission_config(
     - ``external_directory`` is always force-denied if absent — its
       OpenCode default of ``ask`` would cause headless runs to hang
       waiting for user approval that never arrives.
+
+    An allowlist also allows every tool of each server in *mcp_servers*:
+    one that doesn't name them denies them, so the tools the task is about
+    never run. A permission key is matched as a wildcard against the tool
+    name, so ``<server>*`` covers a server's tool set whichever way
+    OpenCode joins server and tool. Added even when ``permission`` is an
+    explicit override, so an attached server isn't left to whatever that
+    override's own default (e.g. a bare ``"*": "ask"``) would do to it.
     """
     permission_config = dict(permission or {})
     if not permission_config and allowed_tools is not None:
         permission_config["*"] = "deny"
         for tool in allowed_tools:
             permission_config[tool] = "allow"
+    for name in mcp_servers or ():
+        permission_config.setdefault(f"{name}*", "allow")
     if "external_directory" not in permission_config:
         permission_config["external_directory"] = "deny"
     return permission_config

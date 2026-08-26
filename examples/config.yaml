@@ -62,6 +62,35 @@ providers:
     judge_model: opencode-go/minimax-m2.5
     pure: true
 
+# MCP servers attached to the agent under evaluation, in the standard MCP
+# JSON shape. `${VAR}` in an `env` or `headers` value is read from the
+# environment agent-exam runs in, so no credential lives in the file; an unset
+# one fails the run at its start. Tasks attach all of these unless they name a
+# subset with their own `mcp_servers:`.
+mcp_servers:
+  files:
+    command: mcp-files
+    args: ["--root", "."]
+    env:
+      FILES_TOKEN: "${FILES_TOKEN}"
+  tickets:
+    type: http
+    url: https://tickets.example.com/mcp
+    headers:
+      Authorization: "Bearer ${TICKETS_TOKEN}"
+  # `oauth` runs a client credentials grant and exports the access token
+  # into `env_var`, for a server whose token isn't pre-obtained.
+  reports:
+    type: http
+    url: https://reports.example.com/mcp
+    oauth:
+      token_url: https://auth.example.com/oauth/token
+      client_id: "${REPORTS_CLIENT_ID}"
+      client_secret: "${REPORTS_CLIENT_SECRET}"
+      env_var: REPORTS_TOKEN
+    headers:
+      Authorization: "Bearer ${REPORTS_TOKEN}"
+
 judge:
   timeout_seconds: 60
 

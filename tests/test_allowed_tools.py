@@ -137,7 +137,7 @@ def test_provider_emits_allowed_tools_flag():
                 ],
                 "extra_args": ["--add-dir", "/extra"],
             },
-            stop_on_first_skill=False,
+            stop_on_first_trigger=False,
             timeout_seconds=30,
         )
 
@@ -186,7 +186,7 @@ def _capture_cmd(provider_options):
             model="",
             cwd=Path("/tmp"),
             provider_options=provider_options,
-            stop_on_first_skill=False,
+            stop_on_first_trigger=False,
             timeout_seconds=30,
         )
     return captured["cmd"]
@@ -241,7 +241,7 @@ def test_provider_omits_flag_when_empty():
             model="",
             cwd=Path("/tmp"),
             provider_options={},
-            stop_on_first_skill=False,
+            stop_on_first_trigger=False,
             timeout_seconds=30,
         )
     assert "--allowed-tools" not in captured["cmd"]

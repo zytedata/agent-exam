@@ -6,7 +6,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,7 +20,8 @@ from .errors import ProviderTimeout, RateLimitExhausted, UsageError
 from .hooks import call_pre_run_hook
 from .ids import new_run_id
 from .judge import JudgeCache, JudgeCall
-from .pool import AttemptOutcome, PoolPlan, run_plan
+from .mcp import preflight as mcp_preflight
+from .pool import AttemptOutcome, PoolPlan, forget_mcp_staging, run_plan
 from .providers import get_provider
 from .providers.skill_staging import discover_skills
 from .report import AttemptReport, report_to_dict, score_attempt
@@ -45,9 +46,12 @@ class RunRequest:
     # Reality-check with *every* skill dropped, not just the suite's
     # evaluated ones — the harness runs as a plain agent.
     no_skills: bool = False
-    # Drop `kind: trigger` tasks from the plan. Implied by the reality-check
-    # modes (no skill loaded → nothing to fire); settable on its own so the
-    # with-skill half of a reality-check comparison covers the same tasks.
+    # Reality-check with the skills in place but no MCP server attached —
+    # the counterfactual that shows how much of the work the servers do.
+    no_mcp: bool = False
+    # Drop `kind: trigger` tasks from the plan. Implied by the skill-
+    # withholding modes (no skill loaded → nothing to fire); settable on its
+    # own so the with-skill half of the comparison covers the same tasks.
     no_triggers: bool = False
     # Tag selection. `tags` (--tag) lifts a tag's default exclusion,
     # `exclude_tags` (--exclude-tag) drops the tasks wearing one, and
@@ -65,11 +69,23 @@ class RunRequest:
                 "--without-skill and --no-skills are mutually exclusive; "
                 "--no-skills already drops every skill"
             )
+        if self.no_mcp and self.skills_withheld:
+            raise UsageError(
+                "--no-mcp is mutually exclusive with --without-skill and "
+                "--no-skills; a run that withholds both cannot say which of "
+                "the two the difference is down to"
+            )
+
+    @property
+    def skills_withheld(self) -> bool:
+        """True when skills are (partly or wholly) withheld from the harness."""
+        return self.without_skill or self.no_skills
 
     @property
     def reality_check(self) -> bool:
-        """True when skills are (partly or wholly) withheld from the harness."""
-        return self.without_skill or self.no_skills
+        """True when the run withholds something the suite is meant to have,
+        so its verdicts describe a counterfactual rather than a regression."""
+        return self.skills_withheld or self.no_mcp
 
 
 def _utc_now_iso() -> str:
@@ -319,13 +335,15 @@ def run(cfg: Config, req: RunRequest) -> int:
     # because a reality-check mode implies it: with the skills withheld there
     # is nothing for a trigger case to fire.
     effective_k = req.k
-    drop_triggers = req.no_triggers or req.reality_check
+    drop_triggers = req.no_triggers or req.skills_withheld
     if drop_triggers:
         tasks = [t for t in tasks if t.kind != "trigger"]
         if not tasks:
             specs_str = ", ".join(f"{s}::{t}" if t else s for s, t in req.specs)
             reason = (
-                "to reality-check" if req.reality_check else "left after --no-triggers"
+                "to reality-check"
+                if req.skills_withheld
+                else "left after --no-triggers"
             )
             raise UsageError(f"no kind: execute tasks found in {specs_str!r} {reason}")
 
@@ -359,6 +377,34 @@ def run(cfg: Config, req: RunRequest) -> int:
             f"specs {specs_str!r} failed validation:\n  "
             + "\n  ".join(f"{c.name}: {c.hint}" for c in validation_fails)
         )
+
+    # Captured before --no-mcp wipes the definitions below, so the run
+    # record says which servers it withheld.
+    mcp_servers_declared = sorted(cfg.mcp_servers)
+
+    if req.no_mcp:
+        if not cfg.mcp_servers:
+            raise UsageError(
+                "--no-mcp: no mcp_servers are declared in evals/config.yaml, "
+                "so the run would be identical to a normal one"
+            )
+        # Detaching every server is the same thing as declaring none, so
+        # staging, the preflight checks and the reports all follow without
+        # a second code path. Task selections are already validated above.
+        cfg = cfg.model_copy(update={"mcp_servers": {}})
+        # A tool trigger grades on MCP calls, which cannot happen with no
+        # server attached: the positives fail and the negatives pass on an
+        # empty trajectory. Skill triggers stay — routing does not need the
+        # tools it routes to. What the survivors select is cleared along with
+        # the definitions, since a selection naming a server no longer in
+        # config.yaml is a load-time error everywhere else.
+        tasks = [replace(t, mcp_servers=[]) for t in tasks if not t.target_tool]
+        if not tasks:
+            specs_str = ", ".join(f"{s}::{t}" if t else s for s, t in req.specs)
+            raise UsageError(
+                f"every task in {specs_str} targets an MCP tool, so there is "
+                f"nothing left to run under --no-mcp"
+            )
 
     paths = RunPaths(cfg.evals_dir, new_run_id(cfg.evals_dir / "runs"))
     paths.run_dir.mkdir(parents=True)
@@ -400,6 +446,8 @@ def run(cfg: Config, req: RunRequest) -> int:
         run_mode = run_modes.NO_SKILLS
     elif req.without_skill:
         run_mode = run_modes.WITHOUT_SKILL
+    elif req.no_mcp:
+        run_mode = run_modes.NO_MCP
     else:
         run_mode = run_modes.NORMAL
 
@@ -439,6 +487,21 @@ def run(cfg: Config, req: RunRequest) -> int:
     # provider-agnostic — each provider owns its own check set.
     for warning in provider.pre_run_warnings(cfg):
         _emit_warning(warning)
+
+    # MCP servers whose command or credentials can't be resolved would only
+    # surface as the agent silently missing its tools, so refuse the run.
+    # Only the servers the planned tasks attach are checked, so a run that
+    # leaves a credentialed server out doesn't need its credential.
+    mcp_checks = mcp_preflight(cfg, provider, tasks)
+    mcp_fails = [c for c in mcp_checks if c.status == "FAIL"]
+    if mcp_fails:
+        raise UsageError(
+            "mcp_servers are not usable:\n  "
+            + "\n  ".join(f"{c.name}: {c.hint}" for c in mcp_fails)
+        )
+    for warning in mcp_checks:
+        if warning.status == "WARN":
+            _emit_warning(warning)
 
     _emit_run_header(
         paths.run_id, req, plan, model, effective_k, concrete, tags_excluded
@@ -521,6 +584,7 @@ def run(cfg: Config, req: RunRequest) -> int:
             click.echo(f"rate-limit exhausted: {exc}", err=True)
     finally:
         heartbeat.stop()
+        forget_mcp_staging(run_tmp_root)
         if req.cleanup_tmp_root:
             shutil.rmtree(run_tmp_root, ignore_errors=True)
 
@@ -544,6 +608,8 @@ def run(cfg: Config, req: RunRequest) -> int:
                 "n_parallel": plan.n_parallel,
                 "without_skill": req.without_skill,
                 "no_skills": req.no_skills,
+                "no_mcp": req.no_mcp,
+                "mcp_servers": mcp_servers_declared,
                 "no_triggers": drop_triggers,
                 "skills_excluded": sorted(skills_to_exclude),
                 "tags": sorted(req.tags),

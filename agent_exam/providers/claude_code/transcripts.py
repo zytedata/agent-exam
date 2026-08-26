@@ -31,6 +31,7 @@ from ...schemas import (
     ToolCallBlock,
     Turn,
 )
+from ...trajectory_walk import record_detected_tool
 from .skill_detect import detect_from_input
 
 _SKIP_ENTRY_TYPES = frozenset(
@@ -397,14 +398,18 @@ def load_run_result(
     wall_time_seconds: float,
     explicit_cost_usd: float | None = None,
     stream_detected_skill: SkillInvocation | None = None,
+    stream_detected_tool: str | None = None,
+    mcp_server_status: dict[str, str] | None = None,
 ) -> RunResult:
     """Parse a transcript on disk into a RunResult (trajectory + metrics).
 
     `stream_detected_skill` is provided when the run was cut short by
-    `stop_on_first_skill`: the transcript may lack the triggering tool_use
+    `stop_on_first_trigger`: the transcript may lack the triggering tool_use
     (we killed before the tool ran) so the provider hands us what it
     observed on the stream. We append it to the last assistant turn's
     skill_invocations if the retrospective walk didn't already pick it up.
+    `stream_detected_tool` is the same story for a trigger task whose
+    target is a tool: the name of the call the kill landed on.
     """
     main_parsed = parse_transcript(str(transcript_path))
     main_zero = main_parsed.get("first_entry_ts")
@@ -430,6 +435,9 @@ def load_run_result(
         zero_ts=main_zero,
         subagent_for_tool_use=subagent_for_tool_use,
     )
+
+    if stream_detected_tool is not None:
+        record_detected_tool(trajectory, stream_detected_tool)
 
     # Aggregate metrics across main + subagents.
     all_tokens_by_model = dict(main_parsed["tokens_by_model"])
@@ -520,6 +528,7 @@ def load_run_result(
         trajectory=trajectory,
         metrics=metrics,
         raw_transcript_path=transcript_path,
+        mcp_server_status=mcp_server_status,
     )
 
 

@@ -22,10 +22,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .errors import AgentExamError, ProviderTimeout, UsageError
+from .mcp import connection_check, is_mcp_tool
 from .providers import get_provider
 from .schemas import RunResult
 from .serde import to_json_dict, write_json
 from .tasks import _FIXTURE_EMPTY_DIR_MARKERS, Task
+from .trajectory_walk import iter_tool_calls
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -50,24 +52,50 @@ class AttemptOutcome:
     attempt_n: int
     attempt_cwd: Path
     run_result: RunResult | None
-    error_verdict: str | None  # "timeout" | None
+    error_verdict: str | None  # "timeout" | "error" | None
 
 
-def _settled_nontrigger(task: Task, run_result: RunResult | None) -> bool:
-    """Whether a timed-out positive trigger already has its answer.
+def _settled_on_timeout(task: Task, run_result: RunResult | None) -> bool:
+    """Whether a timed-out trigger already has its answer.
 
-    A positive trigger ends either on the first skill fire or on the wall
+    A positive skill trigger ends either on the first skill fire or on the wall
     clock, so "no skill fired" can only surface as a timeout. Once the agent
     has run a real tool without reaching for a skill it has routed elsewhere,
-    and the partial trajectory is enough to score `first_skill` — grading it a
-    fail beats discarding the evidence as a framework error. The tool-call
-    floor keeps a genuine cold-start timeout, where the agent never got to act,
-    out of the pass rate.
+    and the partial trajectory is enough to score `first_skill` — grading it
+    beats discarding the evidence as a framework error.
+
+    A positive tool trigger is the same story: it is cut on the first MCP call,
+    so reaching the wall clock means none happened.
+
+    A negative case of either kind keeps its timeout. Nothing cuts one short of
+    the turn ending, so a timeout means the agent was still working, and the
+    target missing from a partial trajectory is no evidence that the next call
+    would not have been it.
+
+    The tool-call floor keeps a genuine cold-start timeout, where the agent
+    never got to act, out of the pass rate.
     """
-    if not task.should_trigger or run_result is None:
+    if run_result is None or run_result.metrics.n_tool_calls == 0:
         return False
-    return run_result.metrics.n_tool_calls > 0 and not any(
-        turn.skill_invocations for turn in run_result.trajectory
+    if not task.should_trigger:
+        return False
+    if task.target_tool:
+        return not any(
+            is_mcp_tool(call.name) for call in iter_tool_calls(run_result.trajectory)
+        )
+    return not any(turn.skill_invocations for turn in run_result.trajectory)
+
+
+def _target_tool_already_called(task: Task, run_result: RunResult) -> bool:
+    """Whether *task*'s target tool was already called in *run_result*.
+
+    A positive tool trigger settles as soon as its target is called, so a
+    sibling MCP server reported as broken afterwards didn't stand in the
+    way of the behavior actually under test — that shouldn't erase a
+    decisive pass.
+    """
+    return task.target_tool is not None and any(
+        call.name == task.target_tool for call in iter_tool_calls(run_result.trajectory)
     )
 
 
@@ -139,6 +167,44 @@ def _mirror_cwd(src: Path, dst: Path) -> None:
     )
 
 
+# Staged MCP configs by (provider, run tmp root, server set). Per worker
+# process, which is as far as the memo has to reach: the pool hands each
+# attempt to a fresh Provider instance, and every attempt asking for the same
+# servers would otherwise re-render an identical config.
+_MCP_STAGING: dict[tuple, dict] = {}
+
+
+def _mcp_options(
+    provider, run_tmp_root: Path, cfg: Config, servers: list[str] | None
+) -> dict:
+    """The provider options that attach *servers*, staged on first use.
+
+    Whatever file the harness needs is rendered under the run tmp root — a
+    sibling of the attempt cwd, never inside it, so a server block holding a
+    credential stays out of the archived cwd.
+    """
+    key = (
+        provider.name,
+        run_tmp_root,
+        None if servers is None else tuple(sorted(servers)),
+    )
+    if key not in _MCP_STAGING:
+        _MCP_STAGING[key] = provider.stage_mcp_config(run_tmp_root, cfg, servers)
+    return _MCP_STAGING[key]
+
+
+def forget_mcp_staging(run_tmp_root: Path) -> None:
+    """Drop every `_MCP_STAGING` entry rendered under *run_tmp_root*.
+
+    `run_tmp_root` is a fresh temp dir per run, so once a run finishes
+    nothing can ever look its entries up again — call this when it does,
+    or the serial path (which staged in this same process) leaks one
+    entry per run forever.
+    """
+    for key in [k for k in _MCP_STAGING if k[1] == run_tmp_root]:
+        del _MCP_STAGING[key]
+
+
 def _execute_attempt(
     task: Task,
     attempt_n: int,
@@ -176,10 +242,14 @@ def _execute_attempt(
     )
     if task.target_skill:
         provider_options["target_skill"] = task.target_skill
+    if task.target_tool:
+        provider_options["target_tool"] = task.target_tool
     if task.should_trigger is False:
         # Negative trigger case: signal the provider to cut early once
-        # the routing decision is evident (first non-Skill tool use or
-        # first message_stop). See stream_parser.negative_trigger_mode.
+        # the routing decision is evident. For a skill target that is the
+        # first non-Skill tool use or the first message_stop; a tool target
+        # has no such shortcut and settles when the turn ends. See
+        # stream_parser.negative_trigger_mode.
         provider_options["negative_trigger"] = True
 
     # Runtime cwd is ephemeral and opaquely-named — no "evals/runs",
@@ -211,15 +281,22 @@ def _execute_attempt(
     # block access to parent-dir skills.
     provider.stage_run_env(runtime_cwd, cfg, skills_to_exclude=skills_to_exclude)
 
-    # Trigger tasks default to 60s: positives get killed on first skill
-    # fire; negatives get killed on first non-Skill tool use or first
-    # message_stop (see negative_trigger_mode). Wall-clock is a
+    provider_options.update(_mcp_options(provider, run_tmp_root, cfg, task.mcp_servers))
+
+    # Skill-target trigger tasks default to 60s: positives get killed on
+    # first skill fire; negatives get killed on first non-Skill tool use or
+    # first message_stop (see negative_trigger_mode). Wall-clock is a
     # fallback for cold-start latency — stream signals handle the
     # fast path. 60s accommodates slower providers (e.g. opencode
     # with z-ai/glm-5.1 takes ~8s to first byte).
+    #
+    # Tool cases get the full task budget instead. The agent looks around
+    # before it reaches for a tool, and an npx-booted stdio server can spend
+    # a fair share of a 60-second budget just starting, so the routing
+    # decision lands far later than a skill fire does.
     if task.timeout_seconds is not None:
         timeout = task.timeout_seconds
-    elif task.kind == "trigger":
+    elif task.kind == "trigger" and not task.target_tool:
         timeout = min(60, cfg.default_task_timeout_seconds)
     else:
         timeout = cfg.default_task_timeout_seconds
@@ -239,7 +316,7 @@ def _execute_attempt(
                 model=model,
                 cwd=runtime_cwd,
                 provider_options=provider_options,
-                stop_on_first_skill=task.stop_on_first_skill,
+                stop_on_first_trigger=task.stop_on_first_trigger,
                 timeout_seconds=timeout,
             )
         finally:
@@ -252,8 +329,25 @@ def _execute_attempt(
         # agent was doing when the timeout fired. Verdict stays
         # "timeout" — we just don't throw away the evidence.
         run_result = exc.partial_run_result
-        if _settled_nontrigger(task, run_result):
+        if _settled_on_timeout(task, run_result):
             error_verdict = None
+
+    # A server that failed to connect — or that the harness never attached
+    # at all — leaves the agent without the tools the task is about, which
+    # grades as a skill failure rather than the setup failure it is.
+    if run_result is not None:
+        connected = connection_check(
+            run_result.mcp_server_status, provider_options.get("mcp_server_names") or ()
+        )
+        if connected.status == "FAIL" and not _target_tool_already_called(
+            task, run_result
+        ):
+            error_verdict = "error"
+            print(
+                f"attempt error {task.suite}::{task.name} "
+                f"attempt-{attempt_n}: MCP servers {connected.hint}",
+                file=sys.stderr,
+            )
 
     attempt_finished = attempt_finished_writer()
 
@@ -296,6 +390,12 @@ def _execute_attempt(
                 "finished_at": attempt_finished,
                 "raw_transcript_path": str(raw_path) if raw_path else None,
                 "metrics": to_json_dict(run_result.metrics),
+                # Names this attempt attached, against the connection status
+                # the harness announced for them.
+                "mcp_servers_attached": list(
+                    provider_options.get("mcp_server_names") or ()
+                ),
+                "mcp_server_status": run_result.mcp_server_status,
             },
         )
         write_json(

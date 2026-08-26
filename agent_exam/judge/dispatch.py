@@ -53,7 +53,7 @@ def call_judge(jc: JudgeCall, prompt: str) -> str:
             model=jc.judge_model,
             cwd=Path(tmp),
             provider_options=jc.provider_options,
-            stop_on_first_skill=False,
+            stop_on_first_trigger=False,
             timeout_seconds=jc.timeout_seconds,
         )
     return _last_assistant_text(run_result.trajectory)
@@ -89,7 +89,7 @@ def call_judge_agent(jc: JudgeCall, prompt: str, attempt_cwd: Path) -> str:
             model=jc.judge_model,
             cwd=judge_cwd,
             provider_options=options,
-            stop_on_first_skill=False,
+            stop_on_first_trigger=False,
             timeout_seconds=jc.agent_timeout_seconds,
         )
     return _last_assistant_text(run_result.trajectory)

@@ -36,7 +36,7 @@ class _StubProvider(Provider):
         model: str,
         cwd: Path,
         provider_options: dict,
-        stop_on_first_skill: bool,
+        stop_on_first_trigger: bool,
         timeout_seconds: int,
     ) -> RunResult:
         cwd_files = sorted(p.name for p in cwd.iterdir()) if cwd.is_dir() else []

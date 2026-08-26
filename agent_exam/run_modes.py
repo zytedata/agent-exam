@@ -5,11 +5,14 @@
   dropped from the staged bundle (the rest stay).
 - `no-skills` — `--no-skills`: nothing is staged at all, so the harness
   runs as a plain agent.
+- `no-mcp` — `--no-mcp`: every skill is staged, but no MCP server is
+  attached.
 
-The latter two are *reality checks*: trigger tasks are skipped (no skill
-to fire), verdicts are informational so the run exits 0 regardless, and
-the inspection commands keep them out of lift-style comparisons against
-normal runs.
+The latter three are *reality checks*: verdicts are informational so the
+run exits 0 regardless, and the inspection commands keep them out of
+lift-style comparisons against normal runs. The skill-withholding two
+also skip trigger tasks, there being no skill left to fire, and `no-mcp`
+skips the trigger tasks with a `tool` target for the same reason.
 """
 
 from __future__ import annotations
@@ -22,10 +25,15 @@ if TYPE_CHECKING:
 NORMAL = "run"
 WITHOUT_SKILL = "without-skill"
 NO_SKILLS = "no-skills"
+NO_MCP = "no-mcp"
 
-_REALITY_CHECK = frozenset({WITHOUT_SKILL, NO_SKILLS})
+_REALITY_CHECK = frozenset({WITHOUT_SKILL, NO_SKILLS, NO_MCP})
 
-_COMPACT = {WITHOUT_SKILL: "w/o-skill", NO_SKILLS: "no-skills"}
+_COMPACT = {
+    WITHOUT_SKILL: "w/o-skill",
+    NO_SKILLS: "no-skills",
+    NO_MCP: "no-mcp",
+}
 
 
 def is_reality_check(run_mode: str) -> bool:
@@ -46,6 +54,8 @@ def banner_lines(run_mode: str, skills_excluded: Sequence[str]) -> list[str]:
     """
     if not is_reality_check(run_mode):
         return []
+    if run_mode == NO_MCP:
+        return ["REALITY CHECK (no MCP servers attached) — verdicts informational"]
     if run_mode == NO_SKILLS:
         lines = ["REALITY CHECK (no skills loaded) — verdicts informational"]
         if skills_excluded:

@@ -12,6 +12,7 @@ from claude_measure_usage.parse import find_transcript_path
 
 from ..._models import _StrictModel
 from ...errors import FrameworkError, ProviderTimeout, RateLimitError
+from ...mcp import canonical_server_prefix, probe_connection_check, stage_mcp_json
 from ...ratelimit import with_retries
 from ...schemas import CheckResult, RunResult
 from ..base import Provider
@@ -65,7 +66,7 @@ class ClaudeCodeProvider(Provider):
         model: str,
         cwd: Path,
         provider_options: dict,
-        stop_on_first_skill: bool,
+        stop_on_first_trigger: bool,
         timeout_seconds: int,
     ) -> RunResult:
         """Invoke with transparent rate-limit retry. See ratelimit.with_retries
@@ -77,7 +78,7 @@ class ClaudeCodeProvider(Provider):
                 model,
                 cwd,
                 provider_options,
-                stop_on_first_skill,
+                stop_on_first_trigger,
                 timeout_seconds,
             )
         )
@@ -88,7 +89,7 @@ class ClaudeCodeProvider(Provider):
         model: str,
         cwd: Path,
         provider_options: dict,
-        stop_on_first_skill: bool,
+        stop_on_first_trigger: bool,
         timeout_seconds: int,
     ) -> RunResult:
         cmd = [
@@ -108,26 +109,44 @@ class ClaudeCodeProvider(Provider):
             "--setting-sources",
             "project,local",
         ]
-        if stop_on_first_skill:
+        if stop_on_first_trigger:
             cmd.append("--include-partial-messages")
         if model:
             cmd.extend(["--model", model])
         mode = provider_options.get("permission_mode")
         if mode:
             cmd.extend(["--permission-mode", str(mode)])
+        mcp_config = provider_options.get("mcp_config_path")
+        if mcp_config:
+            # `--mcp-config` takes a variadic <configs...>: whatever argv
+            # entry follows it must itself be a flag, or it gets swallowed
+            # as another config path.
+            cmd.extend(["--mcp-config", str(mcp_config)])
+        # Always strict, even with no servers of our own: without it the
+        # developer's `~/.claude.json` servers load into the trial, the
+        # same hermeticity rule that keeps their plugins out.
+        cmd.append("--strict-mcp-config")
         allowed = list(provider_options.get("allowed_tools") or [])
-        if allowed and "Skill" not in allowed:
-            # Always pre-approve the Skill tool when an allowlist is set.
-            # `--allowed-tools` is a pre-approval list; in headless `-p`
-            # mode anything outside it falls through to the permission
-            # prompt, which auto-rejects with no human to approve. Without
-            # Skill pre-approved, the agent's natural-language route to a
-            # skill returns is_error=true ("Execute skill: <name>") — the
-            # agent reads that as a real error and gives up. An eval
-            # suite exists to evaluate a skill, so blocking the very
-            # mechanism it tests has no legitimate use case.
-            allowed.append("Skill")
         if allowed:
+            if "Skill" not in allowed:
+                # Always pre-approve the Skill tool when an allowlist is set.
+                # `--allowed-tools` is a pre-approval list; in headless `-p`
+                # mode anything outside it falls through to the permission
+                # prompt, which auto-rejects with no human to approve. Without
+                # Skill pre-approved, the agent's natural-language route to a
+                # skill returns is_error=true ("Execute skill: <name>") — the
+                # agent reads that as a real error and gives up. An eval
+                # suite exists to evaluate a skill, so blocking the very
+                # mechanism it tests has no legitimate use case.
+                allowed.append("Skill")
+            # Same reasoning for every attached MCP server: an allowlist that
+            # doesn't name it auto-rejects its calls, so the tools the task is
+            # about never run. `mcp__<server>` covers that server's tool set.
+            allowed.extend(
+                canonical_server_prefix(name)
+                for name in provider_options.get("mcp_server_names") or ()
+                if canonical_server_prefix(name) not in allowed
+            )
             # Claude Code's `--allowed-tools` takes a variadic <tools...>;
             # joining with commas keeps it a single argv entry so any
             # subsequent flags (including `extra_args`) aren't swallowed.
@@ -150,9 +169,10 @@ class ClaudeCodeProvider(Provider):
         )
 
         state = StreamState()
-        if stop_on_first_skill:
+        if stop_on_first_trigger:
             state.skill_detection_enabled = True
             state.target_skill = provider_options.get("target_skill")
+            state.target_tool = provider_options.get("target_tool")
             state.negative_trigger_mode = bool(provider_options.get("negative_trigger"))
         t_out = threading.Thread(
             target=drain_stream, args=(process.stdout, state), daemon=True
@@ -165,7 +185,7 @@ class ClaudeCodeProvider(Provider):
 
         timed_out = False
         killed_on_skill = False
-        if stop_on_first_skill:
+        if stop_on_first_trigger:
             killed_on_skill, timed_out = self._wait_with_skill_kill(
                 process, state, timeout_seconds
             )
@@ -192,6 +212,8 @@ class ClaudeCodeProvider(Provider):
                             wall_time_seconds=wall_time,
                             explicit_cost_usd=state.total_cost_usd,
                             stream_detected_skill=state.detected_skill,
+                            stream_detected_tool=state.detected_tool,
+                            mcp_server_status=state.mcp_server_status,
                         )
                 except Exception:
                     partial = None
@@ -237,6 +259,8 @@ class ClaudeCodeProvider(Provider):
             wall_time_seconds=wall_time,
             explicit_cost_usd=state.total_cost_usd,
             stream_detected_skill=state.detected_skill,
+            stream_detected_tool=state.detected_tool,
+            mcp_server_status=state.mcp_server_status,
         )
 
     def _wait_with_skill_kill(
@@ -374,6 +398,10 @@ class ClaudeCodeProvider(Provider):
 
         return results
 
+    def stage_mcp_config(self, run_tmp_root: Path, cfg, servers=None) -> dict:
+        """Render `{"mcpServers": ...}` for `--mcp-config`."""
+        return stage_mcp_json(run_tmp_root, cfg, servers)
+
     def probe_checks(self, probe_result, cfg=None) -> list[CheckResult]:
         """Post-probe checks against the round-trip transcript. Catches
         memory leaks and blocked-plugin loading that the static check
@@ -381,6 +409,7 @@ class ClaudeCodeProvider(Provider):
         settings.json)."""
         transcript = probe_result.raw_transcript_path
         results = [hermetic_check(transcript)]
+        results.extend(probe_connection_check(probe_result, cfg))
         if cfg is not None:
             cfg_provider = cfg.provider(self.name)
             results.append(

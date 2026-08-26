@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -11,7 +11,7 @@ else:
     import tomli as tomllib
 
 import yaml
-from pydantic import Field, PrivateAttr, ValidationError
+from pydantic import Field, PrivateAttr, StringConstraints, ValidationError
 
 from ._models import _StrictModel, render_validation_error
 from .errors import UsageError
@@ -112,6 +112,63 @@ class TagConfig(_StrictModel):
     exclude_by_default: bool = False
 
 
+class McpOAuthClientCredentials(_StrictModel):
+    """An OAuth 2.0 client credentials grant, under a server's `oauth:`.
+
+    Resolving the server it belongs to runs the grant against `token_url`
+    and exports the access token into `env_var`, so the server's own
+    `env`/`headers` reference it as `${<env_var>}` the same way they would
+    a token obtained any other way. `${VAR}` in `token_url`, `client_id`,
+    `client_secret` and `scope` is substituted like any other MCP server
+    field.
+    """
+
+    token_url: str
+    client_id: str
+    client_secret: str
+    scope: str | None = None
+    env_var: str
+
+
+class McpStdioServer(_StrictModel):
+    """A stdio MCP server entry under `mcp_servers:`, in the standard MCP
+    JSON shape — so a server block can be copy-pasted from its README.
+    """
+
+    type: Literal["stdio"] = "stdio"
+    command: str
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    oauth: McpOAuthClientCredentials | None = None
+
+
+class McpHttpServer(_StrictModel):
+    """An HTTP or SSE MCP server entry under `mcp_servers:`. `type` defaults
+    to `http`, the transport a bare `{url: ...}` block means.
+    """
+
+    type: Literal["http", "sse"] = "http"
+    url: str
+    headers: dict[str, str] = Field(default_factory=dict)
+    oauth: McpOAuthClientCredentials | None = None
+
+
+McpServerConfig = McpStdioServer | McpHttpServer
+"""One entry under `mcp_servers:`. A plain union rather than a discriminated
+one: `type` is optional in the MCP JSON everyone copy-pastes, so the two
+branches are told apart by `command` vs `url`.
+"""
+
+McpServerName = Annotated[
+    str, StringConstraints(pattern=r"^[A-Za-z0-9-]+(_[A-Za-z0-9-]+)*$")
+]
+"""A server name under `mcp_servers:`. Narrow because the name is both half
+of the `mcp__<server>__<tool>` tool names assertions match on — where a
+doubled underscore would split in the wrong place — and a bare TOML key
+path in the config codex_cli renders, where a dot would nest.
+"""
+
+
 class Config(_StrictModel):
     """The eval framework's runtime config — `evals/config.yaml`
     overlaid with `evals/config.local.yaml`, plus the project + evals
@@ -129,6 +186,10 @@ class Config(_StrictModel):
     # Every tag a suite or task may wear. Undeclared tags are a validation
     # error, so a typo can't silently exclude nothing — or everything.
     tags: dict[str, TagConfig] = Field(default_factory=dict)
+    # MCP servers available to the agent under evaluation. Tasks attach a
+    # subset with their own `mcp_servers:`; definitions live here so
+    # credentials stay out of task files, which reports serialize verbatim.
+    mcp_servers: dict[McpServerName, McpServerConfig] = Field(default_factory=dict)
     # Dotted module:callable path for the pre-run hook, e.g.
     # ``"evals.hooks:pre_run_hook"``. Loaded from ``pyproject.toml
     # [tool.agent-exam] pre_run_hook``.

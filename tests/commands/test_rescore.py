@@ -47,7 +47,7 @@ class _StubJudgeProvider(Provider):
         model: str,
         cwd: Path,
         provider_options: dict,
-        stop_on_first_skill: bool,
+        stop_on_first_trigger: bool,
         timeout_seconds: int,
     ) -> RunResult:
         response = self._response_for(prompt)

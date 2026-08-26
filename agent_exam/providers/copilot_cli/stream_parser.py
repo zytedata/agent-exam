@@ -7,8 +7,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import IO
 
+from ...mcp import server_status_map, settles_tool_trigger
 from ...schemas import SkillInvocation
 from ..base import Provider
+from .transcripts import _request_tool_name
 
 
 @dataclass
@@ -24,6 +26,12 @@ class StreamState:
     # All non-ephemeral events, in arrival order, for trajectory building.
     events: list = field(default_factory=list)
 
+    # MCP server name -> connection status, from the
+    # `session.mcp_servers_loaded` event. A server that fails to start
+    # leaves the agent without its tools and nothing else says so; the
+    # attempt is failed over it (see `mcp.connection_check`).
+    mcp_server_status: dict[str, str] | None = None
+
     # Skill-detection fields (populated when skill_detection_enabled=True).
     # `kill_signal` fires on a match so the provider's main thread can
     # terminate the subprocess early.
@@ -31,6 +39,11 @@ class StreamState:
     target_skill: str | None = None
     detected_skill: SkillInvocation | None = None
     kill_signal: threading.Event = field(default_factory=threading.Event)
+
+    # Tool-targeted trigger: the canonical name of the tool the run is cut
+    # on. Nothing records the call — Copilot announces every tool of a turn
+    # before running any of them, so the trajectory already has it.
+    target_tool: str | None = None
 
     # Negative-trigger mode: kill as soon as the routing decision is clear.
     # For Copilot CLI this is always at assistant.message time (tool calls are
@@ -86,34 +99,45 @@ def _dispatch(line: str, state: StreamState) -> None:
     if not is_ephemeral:
         state.events.append(event)
 
-    if event_type == "session.tools_updated":
+    if event_type == "session.mcp_servers_loaded":
+        statuses = server_status_map((event.get("data") or {}).get("servers"))
+        if statuses is not None:
+            state.mcp_server_status = statuses
+
+    elif event_type == "session.tools_updated":
         model = (event.get("data") or {}).get("model")
         if model and state.model is None:
             state.model = model
 
     elif event_type == "assistant.message":
         if state.skill_detection_enabled:
-            _check_skill_in_message(event, state)
-            # For negative trigger mode: once the model's tool requests are
-            # known (i.e. this message has arrived), if no skill was requested
-            # the routing decision is settled — kill immediately rather than
-            # waiting for tool.execution_start or assistant.turn_end.
-            if (
-                state.negative_trigger_mode
-                and not state.kill_signal.is_set()
-                and state.detected_skill is None
-            ):
-                state.kill_signal.set()
+            if state.target_tool:
+                _check_tool_in_message(event, state)
+            else:
+                _check_skill_in_message(event, state)
+                # For negative trigger mode: once the model's tool requests
+                # are known (i.e. this message has arrived), if the skill was
+                # not requested the routing decision is settled — kill
+                # immediately rather than waiting for tool.execution_start or
+                # assistant.turn_end. A tool target settles at
+                # assistant.turn_end instead: the agent reaches for it after
+                # looking around, so an early message without it decides
+                # nothing.
+                if state.negative_trigger_mode and not state.kill_signal.is_set():
+                    state.kill_signal.set()
 
     elif event_type == "assistant.turn_end":
-        # Belt-and-suspenders: if kill_signal wasn't already set by
-        # assistant.message (e.g. the stream is missing that event),
-        # fire here as a fallback.
+        # Backs up assistant.message, in case the stream is missing that
+        # event, for a skill target: the turn ending without the skill
+        # firing is decisive there. A tool target settles on the target
+        # call alone (see settles_tool_trigger) and otherwise runs the
+        # attempt out to the wall clock, since the agent can still reach
+        # for it on a later turn.
         if (
             state.skill_detection_enabled
             and state.negative_trigger_mode
+            and state.target_tool is None
             and not state.kill_signal.is_set()
-            and state.detected_skill is None
         ):
             state.kill_signal.set()
 
@@ -150,3 +174,21 @@ def _check_skill_in_message(event: dict, state: StreamState) -> None:
         )
         state.kill_signal.set()
         return
+
+
+def _check_tool_in_message(event: dict, state: StreamState) -> None:
+    """Check assistant.message toolRequests for the trigger's target tool.
+
+    Copilot requests every tool of a turn in one message, before any of them
+    runs, so the kill lands with the call already recorded in the stream the
+    trajectory is built from.
+    """
+    for req in (event.get("data") or {}).get("toolRequests") or []:
+        canonical = _request_tool_name(req)
+        if not isinstance(canonical, str) or not canonical:
+            continue
+        if settles_tool_trigger(
+            canonical, state.target_tool, state.negative_trigger_mode
+        ):
+            state.kill_signal.set()
+            return

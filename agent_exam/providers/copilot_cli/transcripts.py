@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ...mcp import join_canonical_tool_name
 from ...schemas import (
     Metrics,
     RunResult,
@@ -16,6 +17,18 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from .stream_parser import StreamState
+
+
+def _request_tool_name(req: dict) -> str:
+    """Name a requested tool, spelling an MCP call `mcp__<server>__<tool>`.
+
+    A request for an MCP tool carries its server and tool in fields of
+    their own, alongside the joined name Copilot shows the model.
+    """
+    server, tool = req.get("mcpServerName"), req.get("mcpToolName")
+    if isinstance(server, str) and isinstance(tool, str) and server and tool:
+        return join_canonical_tool_name(server, tool)
+    return req.get("name", "")
 
 
 def build_run_result(
@@ -39,6 +52,7 @@ def build_run_result(
         metrics=metrics,
         raw_transcript_path=raw_transcript_path,
         model=state.model,
+        mcp_server_status=state.mcp_server_status,
     )
 
 
@@ -103,7 +117,7 @@ def _build_trajectory(events: list[dict], user_prompt: str | None = None) -> lis
                 call_id = req.get("toolCallId", "")
                 if call_id:
                     pending_tool_calls[call_id] = {
-                        "name": req.get("name", ""),
+                        "name": _request_tool_name(req),
                         "arguments": req.get("arguments") or {},
                         "call_id": call_id,
                         "started_at": None,
@@ -124,7 +138,7 @@ def _build_trajectory(events: list[dict], user_prompt: str | None = None) -> lis
                 meta = pending_tool_calls.pop(call_id)
                 current_assistant.add_tool_result(
                     call_id=call_id,
-                    tool_name=data.get("toolName") or meta["name"],
+                    tool_name=meta["name"] or data.get("toolName", ""),
                     arguments=meta["arguments"],
                     started_at=meta.get("started_at"),
                     completed_at=_ts(event),
@@ -139,7 +153,7 @@ def _build_trajectory(events: list[dict], user_prompt: str | None = None) -> lis
                     turns.append(built)
                 current_assistant = None
 
-    # Flush any in-progress turn (e.g. killed early by stop_on_first_skill).
+    # Flush any in-progress turn (e.g. killed early by stop_on_first_trigger).
     if current_assistant is not None:
         built = current_assistant.build()
         if built is not None:
@@ -195,7 +209,7 @@ class _AssistantTurnBuilder:
             call_id = req.get("toolCallId", "")
             if call_id:
                 self._pending[call_id] = {
-                    "name": req.get("name", ""),
+                    "name": _request_tool_name(req),
                     "arguments": req.get("arguments") or {},
                     "started_at": ts,
                 }
@@ -246,7 +260,7 @@ class _AssistantTurnBuilder:
             content.append(TextBlock(text="".join(self._text_parts)))
         content.extend(self._tool_calls)
         # Include tool calls that were requested but never completed (e.g.
-        # the process was killed by stop_on_first_skill before execution_complete).
+        # the process was killed by stop_on_first_trigger before execution_complete).
         for call_id, meta in self._pending.items():
             content.append(
                 ToolCallBlock(

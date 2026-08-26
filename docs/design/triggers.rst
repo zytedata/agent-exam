@@ -101,6 +101,44 @@ The negatives are the valuable part — they tune description precision. Do
 trigger and teach the description nothing. Save the negative slots for
 near-misses that share real domain language.
 
+Triggering a tool instead of a skill
+====================================
+
+Swap ``skill:`` for ``tool:`` when the routing decision under test is a tool
+call — an :ref:`MCP server's <mcp-servers>` tool, typically, where the thing
+being evaluated is the tool description rather than a skill of yours.
+
+.. code-block:: yaml
+
+    kind: trigger
+    tool: mcp__files__search   # the tool expected to be called (or not)
+
+    positive:
+      - Find the invoice we sent in March.
+
+    negative:
+      - What does an invoice number look like?
+
+Cases fan out as before, graded with ``first_tool`` and ``tool_not_called``.
+Positive cases are about which tool the agent picks, so the first MCP call cuts
+the attempt whichever tool it is, and a case that reaches for another server's
+tool first fails — the tool-target counterpart of grading skills on
+``first_skill``. Native tools are ignored throughout: an agent greps and reads
+before deciding, and cutting on that would settle every case before the routing
+decision is observable. For a negative case even an MCP call decides nothing —
+the agent can call one tool and still reach for the target afterwards — so the
+only decisive signal is the turn ending without the call.
+
+Claude Code and Copilot CLI see a call announced before it runs; Codex CLI cuts
+as it starts and OpenCode once it is over, so on those two the tool does run —
+keep that in mind for a tool with side effects. Any tool the agent reaches for
+on the way runs regardless.
+
+Tool cases get the whole ``default_task_timeout_seconds`` rather than the
+60-second trigger default. That default assumes a skill fires immediately;
+here the agent looks around first, and an ``npx``-booted stdio server can spend
+a good part of a minute just starting.
+
 Author bias is a real problem
 =============================
 
@@ -132,10 +170,12 @@ agent the moment it invokes the target skill. Negative cases kill as soon as
 the routing is observably elsewhere: either the agent reaches for a non-skill
 tool, or its first turn ends with no skill fired. On Claude Code, ``Read`` is
 exempt, because some skills inspect files before routing. Codex CLI exposes
-skill use as an announcement and a read of :file:`.agents/skills/<name>/SKILL.md`,
-and its provider uses those stream signals for the same early kill. Either way
-the skill body normally does not execute, and you pay for one short routing
-turn.
+skill use as an announcement and a read of
+:file:`.agents/skills/<name>/SKILL.md`, and its provider uses those stream
+signals for the same early kill. Either way the skill body normally does not
+execute, and you pay for one short routing turn. The negative half of this is a
+skill-target optimization: with a ``tool:`` target, positives cut on the first
+MCP call and negatives run the turn out.
 
 **Shared working directory across attempts, for fixtureless triggers.** All
 fixtureless trigger attempts in a run share one working directory. Claude Code

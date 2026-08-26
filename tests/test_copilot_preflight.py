@@ -2,7 +2,42 @@
 
 from __future__ import annotations
 
+import json
+
+import pytest
+
+from agent_exam.providers.copilot_cli.doctor_probes import (
+    _personal_mcp_servers,
+    check_personal_mcp_servers,
+    personal_mcp_servers,
+)
 from agent_exam.providers.copilot_cli.provider import CopilotCliProvider
+
+
+@pytest.fixture(autouse=True)
+def _uncached_personal_mcp_servers():
+    """`copilot mcp list` is asked once per process, so each test has to ask
+    again."""
+    _personal_mcp_servers.cache_clear()
+
+
+def _fake_copilot(monkeypatch, mcp_servers=()):
+    """Stand in for both `copilot --version` and `copilot mcp list --json`."""
+
+    def fake_run(cmd, *args, **kwargs):
+        class _Out:
+            returncode = 0
+            stderr = ""
+            stdout = (
+                json.dumps({"mcpServers": {name: {} for name in mcp_servers}})
+                if "mcp" in cmd
+                else "copilot 1.0.0"
+            )
+
+        return _Out()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
 
 # --- get_global_skills ------------------------------------------------------
 
@@ -71,15 +106,7 @@ def _run_preflight_check(monkeypatch, tmp_path, global_skills, cfg=None):
         (skills_dir / name / "SKILL.md").write_text("# skill")
     monkeypatch.setenv("HOME", str(home))
 
-    def fake_run(*a, **kw):
-        class _Out:
-            returncode = 0
-            stdout = "copilot 1.0.0"
-            stderr = ""
-
-        return _Out()
-
-    monkeypatch.setattr("subprocess.run", fake_run)
+    _fake_copilot(monkeypatch)
     provider = CopilotCliProvider()
     results = provider.preflight(cfg)
     for r in results:
@@ -142,3 +169,51 @@ def test_preflight_global_skills_no_clash(monkeypatch, tmp_path):
     )
     assert result.status == "OK"
     assert "none clash" in result.hint
+
+
+# --- personal MCP servers check ---------------------------------------------
+
+
+def test_personal_mcp_servers_none(monkeypatch):
+    _fake_copilot(monkeypatch)
+    result = check_personal_mcp_servers(None)
+    assert result.status == "OK"
+    assert result.hint == "none set up"
+
+
+def test_personal_mcp_servers_are_disabled(monkeypatch):
+    _fake_copilot(monkeypatch, ["notes"])
+
+    class FakeCfg:
+        mcp_servers = {"files": {}}
+
+    result = check_personal_mcp_servers(FakeCfg())
+    assert result.status == "OK"
+    assert "notes disabled" in result.hint
+
+
+def test_personal_mcp_server_sharing_a_name_warns(monkeypatch):
+    """A shared name cannot be disabled without disabling the attached
+    server, so it stays enabled behind it."""
+    _fake_copilot(monkeypatch, ["files"])
+
+    class FakeCfg:
+        mcp_servers = {"files": {}}
+
+    result = check_personal_mcp_servers(FakeCfg())
+    assert result.status == "WARN"
+    assert "files" in result.hint
+
+
+def test_personal_mcp_servers_survives_an_unusable_copilot(monkeypatch):
+    """A `copilot mcp list` that cannot run leaves nothing to disable, and
+    the check WARNs rather than reporting a false "none set up"."""
+
+    def fake_run(*args, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    assert personal_mcp_servers() == []
+    result = check_personal_mcp_servers(None)
+    assert result.status == "WARN"
+    assert "copilot mcp list" in result.hint

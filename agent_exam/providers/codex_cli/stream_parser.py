@@ -10,6 +10,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import IO
 
+from ...mcp import join_canonical_tool_name, settles_tool_trigger
 from ...schemas import SkillInvocation
 
 _SKILL_PATH_RE = re.compile(
@@ -47,6 +48,12 @@ class StreamState:
     kill_signal: threading.Event = field(default_factory=threading.Event)
     negative_trigger_mode: bool = False
 
+    # Tool-targeted trigger: the canonical name of the tool the run is cut
+    # on. `detected_tool` holds the spelling Codex's session transcript
+    # uses for it.
+    target_tool: str | None = None
+    detected_tool: str | None = None
+
 
 def drain_stream(
     stdout: IO[bytes],
@@ -69,12 +76,31 @@ def drain_stream(
             _dispatch(line, state)
 
 
+# codex declines to install its helper binaries when CODEX_HOME sits in a
+# temp dir, which a staged one always does, and says so on every run before
+# carrying on regardless. Keeping it out of the tail leaves that for
+# whatever went wrong.
+_PATH_ALIAS_WARNING = "could not create PATH aliases"
+
+
 def drain_stderr(stderr: IO[bytes], state: StreamState) -> None:
+    # Reads raw chunks, not text lines, so a diagnostic written without a
+    # trailing newline still lands in stderr_tail as soon as it arrives,
+    # instead of waiting on a newline a hung child may never write.
     while True:
         chunk = stderr.read1(4096)
         if not chunk:
             break
         state.stderr_tail.extend(chunk)
+
+
+def strip_path_alias_warning(text: str) -> str:
+    """Drop the ``_PATH_ALIAS_WARNING`` line from *text*, so it doesn't
+    crowd out whatever else went wrong in a rendered stderr tail.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if _PATH_ALIAS_WARNING not in line
+    )
 
 
 def _dispatch(line: str, state: StreamState) -> None:
@@ -103,6 +129,7 @@ def _dispatch(line: str, state: StreamState) -> None:
         if (
             state.skill_detection_enabled
             and state.negative_trigger_mode
+            and state.target_tool is None
             and state.detected_skill is None
         ):
             state.kill_signal.set()
@@ -165,6 +192,15 @@ def _unwrap_error_json(message: str) -> str:
 
 
 def _dispatch_skill_detection(item: dict, state: StreamState) -> None:
+    if state.target_tool:
+        name = _tool_name_from_item(item)
+        if name and settles_tool_trigger(
+            name, state.target_tool, state.negative_trigger_mode
+        ):
+            state.detected_tool = name
+            state.kill_signal.set()
+        return
+
     detected = _skill_detection_from_item(item)
     if detected:
         skill, trigger_kind = detected
@@ -192,6 +228,24 @@ def _dispatch_skill_detection(item: dict, state: StreamState) -> None:
         item_type == "command_execution" and not _item_is_file_read(item)
     ) or item_type in ("web_search", "file_change", "mcp_tool_call"):
         state.kill_signal.set()
+
+
+def _tool_name_from_item(item: dict) -> str | None:
+    """The name of the tool call *item* is, if it is one.
+
+    An MCP call names its server and tool separately, spelling out the same
+    name the session transcript gives it; Codex's own tools are named after
+    the item type.
+    """
+    item_type = item.get("type")
+    if item_type == "mcp_tool_call":
+        server, tool = item.get("server"), item.get("tool")
+        if isinstance(server, str) and isinstance(tool, str):
+            return join_canonical_tool_name(server, tool)
+        return None
+    if item_type in ("command_execution", "web_search"):
+        return item_type
+    return None
 
 
 def _item_is_file_read(item: dict) -> bool:

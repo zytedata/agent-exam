@@ -40,6 +40,11 @@ These appear at the top of any task file.
     Tags this task wears, on top of its suite's. Each must be declared in
     :file:`evals/config.yaml`; see :ref:`tags`.
 
+``mcp_servers``
+    Which of the servers declared in :file:`evals/config.yaml` to attach,
+    by name; see :ref:`mcp-servers`. Absent attaches all of them, ``[]``
+    attaches none, and a name that is not declared fails validation.
+
 ``timeout_seconds``
     Per-attempt wall-clock timeout, overriding
     ``default_task_timeout_seconds``.
@@ -66,15 +71,20 @@ Execute-task fields
 Trigger-task fields
 ===================
 
-``skill`` (required)
+``skill``
     The skill expected to fire, or expected not to, depending on which list the
     case appears in.
 
+``tool``
+    A tool expected to be called, or expected not to be, instead of a skill —
+    an MCP one, spelled ``mcp__<server>__<tool>``, being the point of it.
+    Exactly one of ``skill`` and ``tool`` is required.
+
 ``positive``
-    User prompts that should fire ``skill``.
+    User prompts that should fire the target.
 
 ``negative``
-    User prompts that should not fire ``skill``.
+    User prompts that should not fire it.
 
 At least one of ``positive`` and ``negative`` must be non-empty. Each entry is
 a plain prompt string; per-case structural overrides are not supported, though
@@ -82,7 +92,8 @@ a file-level ``setup.fixture:`` applies to every case.
 
 ``assertions`` is not used on trigger tasks — the framework generates the
 appropriate assertion per case, ``first_skill`` for positives and
-``skill_not_invoked`` for negatives.
+``skill_not_invoked`` for negatives, or ``first_tool`` and ``tool_not_called``
+for a ``tool`` target.
 
 .. _assertion-meta-fields:
 
@@ -224,8 +235,10 @@ including in subagents.
         name: Bash
 
 ``name``
-    Tool name. These are harness-specific, so usually pair this with
-    ``providers:``.
+    Tool name. Native tool names are harness-specific, so usually pair this
+    with ``providers:``; a tool served by a declared MCP server reaches the
+    trajectory as ``mcp__<server>__<tool>`` whichever harness ran, so one line
+    grades everywhere.
 
 ``tool_not_called``
 -------------------
@@ -276,6 +289,25 @@ name. This is what trigger evals generate for their positive cases.
 
 ``skill``
     Expected skill name.
+
+``first_tool``
+--------------
+
+Asserts that the given tool is the first MCP tool the agent reached for. Native
+tools are ignored — an agent greps and reads before deciding which tool the
+request calls for — so this fails only when it called some other MCP tool
+first, or none at all. This is what trigger evals with a ``tool`` target
+generate for their positive cases.
+
+.. code-block:: yaml
+
+    - first_tool: mcp__files__search
+    # or:
+    - first_tool:
+        name: mcp__files__search
+
+``name``
+    Expected tool name.
 
 ``skill_not_invoked``
 ---------------------
@@ -459,8 +491,8 @@ Normalized tool names:
 ``image_generation``
     Codex's image tool. The base64 result is elided.
 
-Custom and freeform tools, and MCP-server tools, keep their own names.
-``spawn_agent`` and ``wait`` cover subagent spawning and waiting.
+Custom and freeform tools keep their own names. ``spawn_agent`` and ``wait``
+cover subagent spawning and waiting.
 
 ``copilot_cli``
 ---------------

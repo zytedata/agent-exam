@@ -55,6 +55,31 @@ def count_tool_calls(
     )
 
 
+def record_detected_tool(trajectory: list[Turn], name: str) -> None:
+    """Add the tool call a trigger run was cut on, unless it is already there.
+
+    The kill can land before the harness records the call, leaving the
+    assertion the trigger case generates with nothing to grade. *name* is
+    the call as the harness spells it, so the match against the trajectory
+    happens before any canonicalization.
+    """
+    for call in iter_tool_calls(trajectory):
+        if call.name == name:
+            return
+    block = ToolCallBlock(
+        tool_use_id="",
+        name=name,
+        input={},
+        status="aborted",
+        result="",
+    )
+    for turn in reversed(trajectory):
+        if turn.role == "assistant":
+            turn.content.append(block)
+            return
+    trajectory.append(Turn(role="assistant", content=[block]))
+
+
 def first_skill_invocation(trajectory: list[Turn]) -> SkillInvocation | None:
     """Return the first SkillInvocation across the trajectory tree, or None."""
     for turn in walk_turns(trajectory):

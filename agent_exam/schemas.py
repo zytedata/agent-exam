@@ -97,6 +97,9 @@ class RunResult:
     # when the provider has its own default, e.g. OpenCode defaulting to
     # kimi-k2.6 when no --model flag is passed).
     model: str | None = None
+    # MCP server name -> connection status, as the harness announced it at
+    # session start. `None` when the harness reports nothing.
+    mcp_server_status: dict[str, str] | None = None
 
 
 @dataclass

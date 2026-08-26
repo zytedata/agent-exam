@@ -9,10 +9,12 @@ from typing import TYPE_CHECKING, ClassVar
 
 from ..._models import _StrictModel
 from ...errors import FrameworkError, ProviderTimeout
+from ...mcp import probe_connection_check, stage_mcp_json
 from ...ratelimit import with_retries
 from ..base import Provider
 from ..child_env import build_child_env
 from ..process_utils import terminate_tree, wait_or_terminate
+from .doctor_probes import personal_mcp_servers
 from .stream_parser import StreamState, drain_stderr, drain_stream
 from .transcripts import build_run_result
 
@@ -52,7 +54,7 @@ class CopilotCliProvider(Provider):
         model: str,
         cwd: Path,
         provider_options: dict,
-        stop_on_first_skill: bool,
+        stop_on_first_trigger: bool,
         timeout_seconds: int,
     ) -> RunResult:
         """Invoke with transparent rate-limit retry.
@@ -67,7 +69,7 @@ class CopilotCliProvider(Provider):
                 model,
                 cwd,
                 provider_options,
-                stop_on_first_skill,
+                stop_on_first_trigger,
                 timeout_seconds,
             )
         )
@@ -78,12 +80,33 @@ class CopilotCliProvider(Provider):
         model: str,
         cwd: Path,
         provider_options: dict,
-        stop_on_first_skill: bool,
+        stop_on_first_trigger: bool,
         timeout_seconds: int,
     ) -> RunResult:
         cmd = ["copilot", "-p", prompt, "--output-format", "json"]
         if model:
             cmd.extend(["--model", model])
+
+        # `--additional-mcp-config` augments Copilot CLI's other MCP sources.
+        # There is no strict counterpart, so each source is turned off by
+        # hand — they would otherwise compete for tool calls with the
+        # servers under evaluation. The built-in servers go as a set; the
+        # developer's user config and installed plugins go by name. The
+        # remaining source is the workspace, which here is the attempt's own
+        # staged directory.
+        #
+        # A name this run attaches is left alone: `--disable-mcp-server`
+        # works on the merged set, so disabling it would take the attached
+        # server with it. Copilot CLI merges the additional config last, so
+        # that name resolves to the configured definition either way.
+        cmd.append("--disable-builtin-mcps")
+        attached = tuple(provider_options.get("mcp_server_names") or ())
+        for name in personal_mcp_servers():
+            if name not in attached:
+                cmd.extend(["--disable-mcp-server", name])
+        mcp_config = provider_options.get("mcp_config_path")
+        if mcp_config:
+            cmd.extend(["--additional-mcp-config", f"@{mcp_config}"])
 
         # Per-task tool restriction: if `allowed_tools` is provided, restrict
         # the model to exactly those tools (plus skill + report_intent which are
@@ -95,7 +118,10 @@ class CopilotCliProvider(Provider):
         if allowed:
             # Precise mode: only the listed tools (plus internal ones) are
             # visible to the model — anything else is hidden entirely.
-            tools = list(dict.fromkeys([*allowed, "skill", "report_intent"]))
+            # A server name stands for its whole tool set on both flags,
+            # the only way to name MCP tools here: their own names are
+            # unknown until the server is dialed.
+            tools = list(dict.fromkeys([*allowed, *attached, "skill", "report_intent"]))
             cmd.extend(["--available-tools", ",".join(tools)])
             for t in tools:
                 cmd.extend(["--allow-tool", t])
@@ -129,9 +155,10 @@ class CopilotCliProvider(Provider):
         )
 
         state = StreamState(provider=self)
-        if stop_on_first_skill:
+        if stop_on_first_trigger:
             state.skill_detection_enabled = True
             state.target_skill = provider_options.get("target_skill")
+            state.target_tool = provider_options.get("target_tool")
             state.negative_trigger_mode = bool(provider_options.get("negative_trigger"))
 
         t_out = threading.Thread(
@@ -145,7 +172,7 @@ class CopilotCliProvider(Provider):
 
         timed_out = False
         killed_on_skill = False
-        if stop_on_first_skill:
+        if stop_on_first_trigger:
             killed_on_skill, timed_out = self._wait_with_skill_kill(
                 process, state, timeout_seconds
             )
@@ -226,10 +253,14 @@ class CopilotCliProvider(Provider):
 
         return [name for name, _ in discover_skills(skill_roots)]
 
+    def stage_mcp_config(self, run_tmp_root: Path, cfg, servers=None) -> dict:
+        """Render `{"mcpServers": ...}` for `--additional-mcp-config`."""
+        return stage_mcp_json(run_tmp_root, cfg, servers)
+
     def preflight(self, cfg=None) -> list[CheckResult]:
-        """Binary version check + personal-skills leak warning."""
+        """Binary version check + personal skill and MCP server leak warnings."""
         from ..skill_staging import check_global_skills_against_staged
-        from .doctor_probes import check_binary
+        from .doctor_probes import check_binary, check_personal_mcp_servers
 
         results = [check_binary()]
         if results[0].status == "FAIL":
@@ -242,25 +273,31 @@ class CopilotCliProvider(Provider):
                 check_name="personal skills",
             )
         )
+        results.append(check_personal_mcp_servers(cfg))
         return results
 
     def probe_checks(self, probe_result, cfg=None) -> list[CheckResult]:
-        """Post-probe: verify the model name was captured."""
+        """Post-probe: verify the model name was captured and every
+        attached MCP server connected."""
         from .doctor_probes import check_probe_model
 
-        return [check_probe_model(probe_result)]
+        results = [check_probe_model(probe_result)]
+        results.extend(probe_connection_check(probe_result, cfg))
+        return results
 
     def pre_run_warnings(self, cfg=None) -> list[CheckResult]:
-        """Warn before any trial if personal skills could leak."""
+        """Warn before any trial if personal skills or MCP servers could leak."""
         from ..skill_staging import check_global_skills_against_staged
+        from .doctor_probes import check_personal_mcp_servers
 
-        result = check_global_skills_against_staged(
-            self.get_global_skills(),
-            cfg,
-            self.name,
-            check_name="personal skills",
-        )
-        # Only surface as a warning at run-start when non-empty.
-        if result.status == "WARN":
-            return [result]
-        return []
+        results = [
+            check_global_skills_against_staged(
+                self.get_global_skills(),
+                cfg,
+                self.name,
+                check_name="personal skills",
+            ),
+            check_personal_mcp_servers(cfg),
+        ]
+        # Only surface as warnings at run-start when non-empty.
+        return [r for r in results if r.status == "WARN"]

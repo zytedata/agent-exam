@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a013ea-a219-7131-86b5-49ffe35bee4c"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’m checking the connected document tools first so I can search the archive directly rather than guessing at where the invoice lives."}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"I found a document-search tool that targets invoices and receipts directly. I’m querying for March invoices now, then I’ll narrow to the best match if there are multiple hits."}}
+{"type":"item.started","item":{"id":"item_2","type":"mcp_tool_call","server":"files","tool":"search","arguments":{"query":"invoice March"},"result":null,"error":null,"status":"in_progress"}}

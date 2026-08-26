@@ -23,6 +23,7 @@ import click
 from ..config import Config, find_project_root, load_config
 from ..errors import UsageError
 from ..hooks import call_pre_run_hook
+from ..mcp import preflight as mcp_preflight
 from ..providers import get_provider
 from ..providers.skill_staging import discover_skills
 from ..schemas import CheckResult
@@ -212,7 +213,7 @@ def _provider_checks(cfg: Config, provider_name: str) -> list[CheckResult]:
                 hint=str(exc),
             )
         ]
-    return list(provider.preflight(cfg))
+    return [*provider.preflight(cfg), *mcp_preflight(cfg, provider)]
 
 
 def _provider_or_none(provider_name: str):
@@ -258,16 +259,27 @@ def _round_trip_check(cfg: Config, provider_name: str) -> list[CheckResult]:
         ]
 
     with tempfile.TemporaryDirectory(prefix="agent-exam-doctor-") as tmp:
+        # Laid out like an attempt: the cwd is a directory of its own under a
+        # tmp root, and whatever a provider stages beside it — an MCP config,
+        # a raw stream — is a sibling rather than something the agent sees.
+        cwd = Path(tmp) / "cwd"
+        cwd.mkdir()
         try:
+            # Attach the configured servers so the probe's own session
+            # reports whether each one connects — the cheapest place to
+            # catch a server that dies on startup.
+            probe_options = {
+                "extra_args": list(provider_cfg.extra_args),
+                "permission_mode": provider_cfg.permission_mode,
+            }
+            if cfg.mcp_servers:
+                probe_options.update(provider.stage_mcp_config(Path(tmp), cfg))
             result = provider.invoke(
                 prompt="Respond with just the two characters: ok",
                 model=model,
-                cwd=Path(tmp),
-                provider_options={
-                    "extra_args": list(provider_cfg.extra_args),
-                    "permission_mode": provider_cfg.permission_mode,
-                },
-                stop_on_first_skill=False,
+                cwd=cwd,
+                provider_options=probe_options,
+                stop_on_first_trigger=False,
                 timeout_seconds=60,
             )
         except Exception as exc:
