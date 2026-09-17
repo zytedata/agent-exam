@@ -24,11 +24,12 @@ from ..config import Config, find_project_root, load_config
 from ..errors import UsageError
 from ..hooks import call_pre_run_hook
 from ..mcp import preflight as mcp_preflight
+from ..mcp import tool_inventory
 from ..providers import get_provider
 from ..providers.skill_staging import discover_skills
 from ..schemas import CheckResult
-from ..tasks import list_suites
-from ..validation import validate_suite
+from ..tasks import list_suites, load_suite
+from ..validation import check_trigger_tools, trigger_servers, validate_suite
 from ._format import fmt_cost
 
 
@@ -194,12 +195,49 @@ def _framework_checks(cfg: Config, provider_name: str) -> list[CheckResult]:
 
 def _suite_checks(cfg: Config) -> list[CheckResult]:
     """Static validation of every suite — tasks parse, referenced
-    fixtures exist. Shares `validate_suite` with the runner (which fails
-    fast on any FAIL before spending tokens).
+    fixtures exist — then the one check that needs the servers: the tools
+    the trigger tasks target exist. Shares both with the runner (which
+    fails fast on any FAIL before spending tokens).
     """
     results: list[CheckResult] = []
+    loaded: dict[str, list] = {}
     for suite in list_suites(cfg.evals_dir):
         results.extend(validate_suite(cfg, suite))
+        try:
+            loaded[suite] = load_suite(cfg.evals_dir, suite)
+        except UsageError:
+            continue  # reported by validate_suite above
+    results.extend(_trigger_tool_checks(cfg, loaded))
+    return results
+
+
+def _trigger_tool_checks(cfg: Config, loaded: dict[str, list]) -> list[CheckResult]:
+    """Ask the servers the trigger tasks attach for their tools, once for
+    all suites, and check every target against the listings. A server that
+    cannot be asked is a WARN — the connection checks say what is wrong
+    with it — and the targets it might serve go unchecked.
+    """
+    servers: set[str] = set()
+    for tasks in loaded.values():
+        servers |= trigger_servers(cfg, tasks)
+    if not servers:
+        return []
+    inventory = tool_inventory(cfg, servers)
+    results: list[CheckResult] = []
+    if inventory.errors:
+        results.append(
+            CheckResult(
+                name="mcp tool listings",
+                status="WARN",
+                hint="trigger tool names not checked against: "
+                + "; ".join(
+                    f"{name} ({error})"
+                    for name, error in sorted(inventory.errors.items())
+                ),
+            )
+        )
+    for suite, tasks in loaded.items():
+        results.extend(check_trigger_tools(suite, cfg, tasks, inventory))
     return results
 
 

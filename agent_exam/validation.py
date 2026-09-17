@@ -13,12 +13,17 @@ Checks are environment-independent with one exception: fixture hygiene
 shells out to `git` to find fixture content that isn't under version
 control. It stays silent where git can't be asked, so a project that
 doesn't use git is unaffected.
+
+:func:`check_trigger_tools` is the one check that needs the environment —
+the tool listings of the attached MCP servers — so it is a separate call
+both callers make once they have them.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
+from difflib import get_close_matches
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -28,7 +33,11 @@ from .schemas import CheckResult
 from .tasks import load_suite, load_suite_config
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from .config import Config
+    from .mcp import ToolInventory
+    from .tasks import Task
 
 
 def _git(fixtures_dir: Path, *args: str) -> subprocess.CompletedProcess | None:
@@ -413,33 +422,114 @@ def validate_suite(
             )
         )
 
-    # A bare mcp_tool: value that starts with an attached server's name reads
-    # as the server folded into the tool name, the way some harnesses spell a
-    # call; the trajectory is canonicalized before grading, so left as written
-    # it can never match, and every positive case would silently fail while
-    # every negative case silently passed.
-    misspelled = sorted(
-        {
-            tool
-            for t in tasks
-            if t.target_tool
-            and canonical_tool_server(t.target_tool) is None
-            and (tool := split_canonical_tool_name(t.target_tool)[1])
-            != canonical_tool_name(
-                tool, cfg.mcp_servers if t.mcp_servers is None else t.mcp_servers
-            )
-        }
-    )
-    if misspelled:
-        results.append(
-            CheckResult(
-                name=f"{suite}: trigger tool names",
-                status="FAIL",
-                hint=(
-                    "server name folded into the tool name, "
-                    "spell it as server: and tool: instead: " + ", ".join(misspelled)
-                ),
-            )
-        )
-
     return results
+
+
+def _attached(cfg: Config, task: Task) -> list[str]:
+    """The servers *task* attaches: its own selection, else every declared one."""
+    if task.mcp_servers is None:
+        return list(cfg.mcp_servers)
+    return [name for name in task.mcp_servers if name in cfg.mcp_servers]
+
+
+def trigger_servers(cfg: Config, tasks: Iterable[Task]) -> set[str]:
+    """The servers whose tool listings :func:`check_trigger_tools` needs for
+    *tasks*: the ones attached by the tasks that target a tool."""
+    names: set[str] = set()
+    for task in tasks:
+        if task.target_tool:
+            names.update(_attached(cfg, task))
+    return names
+
+
+def _folded(tool: str, server: str, served: frozenset[str]) -> tuple[str, str] | None:
+    """The ``{server: ..., tool: ...}`` spelling of *tool*, and the tool it
+    names, when *tool* reads as *server*'s name folded onto one of the tools
+    it serves — ``files_search`` for ``search`` on ``files``. That is how some
+    harnesses spell a call to it, and so an easy way to misspell a target."""
+    canonical = canonical_tool_name(tool, [server])
+    if canonical == tool:
+        return None
+    _, remainder = split_canonical_tool_name(canonical)
+    if remainder not in served:
+        return None
+    return f"{{server: {server}, tool: {remainder}}}", remainder
+
+
+def _missing(
+    target: str, server: str | None, tool: str, listed: dict[str, frozenset[str]]
+) -> str:
+    """Why *target* was not found among *listed*, with the likely fix."""
+    suggestions: list[str] = []
+    named: set[str] = set()
+    for name, served in listed.items():
+        folded = _folded(tool, name, served)
+        if folded:
+            suggestions.append(folded[0])
+            named.add(folded[1])
+    served_anywhere = sorted({name for served in listed.values() for name in served})
+    suggestions.extend(
+        s for s in get_close_matches(tool, served_anywhere, n=3) if s not in named
+    )
+    if server is None:
+        what = f"no attached server has a tool named {tool!r}"
+    else:
+        what = f"{target}: server {server} has no tool {tool!r}"
+    if suggestions:
+        what += "; did you mean " + ", ".join(suggestions) + "?"
+    return what
+
+
+def check_trigger_tools(
+    suite: str, cfg: Config, tasks: Iterable[Task], inventory: ToolInventory
+) -> list[CheckResult]:
+    """Whether the tools the suite's trigger tasks target exist, going by the
+    attached servers' own tool listings.
+
+    A target no attached server serves fails every positive case as a
+    routing miss and passes every negative one, both silently — the same
+    shape as a typo'd assertion type, so it is a FAIL. A pinned target
+    (``server:`` and ``tool:``) is looked up on that server, a bare one on
+    every server the task attaches. A server that could not be asked
+    (``inventory.errors``) neither confirms nor refutes: the targets it might
+    serve are left unchecked, and the caller reports why it went unasked.
+    """
+    failures: list[str] = []
+    found = unchecked = 0
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for task in tasks:
+        if not task.target_tool:
+            continue
+        attached = tuple(_attached(cfg, task))
+        # A trigger file fans out into one task per case; check it once.
+        if (task.target_tool, attached) in seen:
+            continue
+        seen.add((task.target_tool, attached))
+        server, tool = split_canonical_tool_name(task.target_tool)
+        candidates = [server] if server is not None else list(attached)
+        listed = {
+            name: inventory.tools[name]
+            for name in candidates
+            if name in inventory.tools
+        }
+        if any(tool in served for served in listed.values()):
+            found += 1
+        elif len(listed) < len(candidates):
+            unchecked += 1
+        else:
+            failures.append(_missing(task.target_tool, server, tool, listed))
+
+    if failures:
+        return [
+            CheckResult(
+                name=f"{suite}: trigger tools exist",
+                status="FAIL",
+                hint="\n  ".join(failures),
+            )
+        ]
+    if not found:
+        return []
+    hint = f"{found} target(s) found on the attached servers"
+    if unchecked:
+        hint += f", {unchecked} unchecked (server not listed)"
+    return [CheckResult(name=f"{suite}: trigger tools exist", status="OK", hint=hint)]

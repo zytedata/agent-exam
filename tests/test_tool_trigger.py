@@ -274,32 +274,210 @@ def test_a_tool_of_a_server_the_task_leaves_out_fails_validation(tmp_path):
     ]
 
 
-def test_a_tool_name_with_the_server_folded_in_fails_validation(tmp_path):
-    """`files_search` reads as the server folded into the tool name — left as
-    written it can never match a canonicalized trajectory."""
-    from agent_exam.validation import validate_suite
-
+def _mcp_project(tmp_path: Path, *tasks: tuple[str, str], servers=("files",)) -> Path:
     root = tmp_path / "proj"
     (root / "evals" / "suites" / "s" / "tasks").mkdir(parents=True)
     (root / "pyproject.toml").write_text('[tool.agent-exam]\nevals_dir = "evals"\n')
     (root / "evals" / "config.yaml").write_text(
-        "default_harness: dummy\nskills_dirs: []\nmcp_servers:\n  files:\n    command: sh\n"
+        "default_harness: dummy\nskills_dirs: []\nmcp_servers:\n"
+        + "".join(f"  {name}:\n    command: sh\n" for name in servers)
     )
-    (root / "evals" / "suites" / "s" / "tasks" / "typo.yaml").write_text(
-        "kind: trigger\nmcp_tool: files_search\npositive: [hi]\n"
-    )
-    (root / "evals" / "suites" / "s" / "tasks" / "fine.yaml").write_text(
-        "kind: trigger\nmcp_tool: search\npositive: [hi]\n"
+    for name, body in tasks:
+        (root / "evals" / "suites" / "s" / "tasks" / name).write_text(dedent(body))
+    return root
+
+
+def _dummy_request() -> RunRequest:
+    return RunRequest(
+        specs=[("s", None)],
+        provider="dummy",
+        model="",
+        k=1,
+        n_parallel=1,
+        without_skill=False,
     )
 
-    fails = [c for c in validate_suite(load_config(root), "s") if c.status == "FAIL"]
 
-    assert [c.hint for c in fails] == [
+def _trigger_checks(root: Path, inventory) -> list:
+    from agent_exam.tasks import load_suite
+    from agent_exam.validation import check_trigger_tools
+
+    cfg = load_config(root)
+    return check_trigger_tools("s", cfg, load_suite(cfg.evals_dir, "s"), inventory)
+
+
+def test_a_tool_named_after_its_server_is_not_a_misspelling(tmp_path):
+    """`files_search` is what a call to `search` on `files` looks like on some
+    harnesses, and also a perfectly good name for a tool: only the server
+    can tell, so static validation no longer guesses."""
+    from agent_exam.mcp import ToolInventory
+    from agent_exam.validation import validate_suite
+
+    root = _mcp_project(
+        tmp_path, ("t.yaml", "kind: trigger\nmcp_tool: files_search\npositive: [hi]\n")
+    )
+
+    assert not [c for c in validate_suite(load_config(root), "s") if c.status == "FAIL"]
+    inventory = ToolInventory(tools={"files": frozenset({"files_search", "read"})})
+    [check] = _trigger_checks(root, inventory)
+    assert (check.status, check.hint) == (
+        "OK",
+        "1 target(s) found on the attached servers",
+    )
+
+
+def test_a_bare_target_no_attached_server_serves_fails_with_the_likely_fix(tmp_path):
+    from agent_exam.mcp import ToolInventory
+
+    root = _mcp_project(
+        tmp_path,
+        ("folded.yaml", "kind: trigger\nmcp_tool: files_search\npositive: [hi]\n"),
+        ("typo.yaml", "kind: trigger\nmcp_tool: serach\npositive: [hi]\n"),
+        ("fine.yaml", "kind: trigger\nmcp_tool: read\nnegative: [hi]\n"),
+    )
+    inventory = ToolInventory(tools={"files": frozenset({"search", "read"})})
+
+    [check] = _trigger_checks(root, inventory)
+
+    assert check.status == "FAIL"
+    assert check.hint.split("\n  ") == [
         (
-            "server name folded into the tool name, "
-            "spell it as server: and tool: instead: files_search"
-        )
+            "no attached server has a tool named 'files_search'; "
+            "did you mean {server: files, tool: search}?"
+        ),
+        "no attached server has a tool named 'serach'; did you mean search?",
     ]
+
+
+def test_a_pinned_target_its_server_does_not_serve_fails(tmp_path):
+    from agent_exam.mcp import ToolInventory
+
+    root = _mcp_project(
+        tmp_path,
+        (
+            "t.yaml",
+            "kind: trigger\nmcp_tool: {server: files, tool: serach}\npositive: [hi]\n",
+        ),
+    )
+    inventory = ToolInventory(tools={"files": frozenset({"search"})})
+
+    [check] = _trigger_checks(root, inventory)
+
+    assert check.status == "FAIL"
+    assert check.hint == (
+        "mcp__files__serach: server files has no tool 'serach'; did you mean search?"
+    )
+
+
+def test_a_bare_target_is_looked_for_on_every_server_the_task_attaches(tmp_path):
+    from agent_exam.mcp import ToolInventory
+
+    root = _mcp_project(
+        tmp_path,
+        (
+            "t.yaml",
+            "kind: trigger\nmcp_tool: search\nmcp_servers: [tickets]\npositive: [hi]\n",
+        ),
+        servers=("files", "tickets"),
+    )
+    inventory = ToolInventory(
+        tools={"files": frozenset({"search"}), "tickets": frozenset({"open"})}
+    )
+
+    [check] = _trigger_checks(root, inventory)
+
+    assert check.status == "FAIL"
+    assert check.hint == "no attached server has a tool named 'search'"
+
+
+def test_the_targets_of_a_server_that_could_not_be_asked_go_unchecked(tmp_path):
+    """No listing, no verdict: the server may well serve the tool."""
+    from agent_exam.mcp import ToolInventory
+
+    root = _mcp_project(
+        tmp_path,
+        ("a.yaml", "kind: trigger\nmcp_tool: search\npositive: [hi]\n"),
+        (
+            "b.yaml",
+            "kind: trigger\nmcp_tool: {server: tickets, tool: open}\npositive: [hi]\n",
+        ),
+        servers=("files", "tickets"),
+    )
+    nothing = ToolInventory(errors={"files": "cannot reach", "tickets": "cannot reach"})
+    assert _trigger_checks(root, nothing) == []
+
+    partial = ToolInventory(
+        tools={"files": frozenset({"search"})}, errors={"tickets": "cannot reach"}
+    )
+    [check] = _trigger_checks(root, partial)
+    assert check.status == "OK"
+    assert check.hint == (
+        "1 target(s) found on the attached servers, 1 unchecked (server not listed)"
+    )
+
+
+def test_only_the_servers_the_trigger_tasks_attach_are_asked(tmp_path):
+    from agent_exam.tasks import load_suite
+    from agent_exam.validation import trigger_servers
+
+    root = _mcp_project(
+        tmp_path,
+        (
+            "t.yaml",
+            "kind: trigger\nmcp_tool: search\nmcp_servers: [files]\npositive: [hi]\n",
+        ),
+        ("e.yaml", "kind: execute\nprompt: x\nassertions: []\n"),
+        servers=("files", "tickets"),
+    )
+    cfg = load_config(root)
+
+    assert trigger_servers(cfg, load_suite(cfg.evals_dir, "s")) == {"files"}
+
+
+def test_a_run_refuses_a_target_the_servers_do_not_serve(tmp_path, monkeypatch):
+    from agent_exam.mcp import ToolInventory
+
+    root = _mcp_project(
+        tmp_path, ("t.yaml", "kind: trigger\nmcp_tool: serach\npositive: [hi]\n")
+    )
+    asked: list[set[str]] = []
+
+    def listing(cfg, names, **kwargs):
+        asked.append(set(names))
+        return ToolInventory(tools={"files": frozenset({"search"})})
+
+    monkeypatch.setattr("agent_exam.runner.tool_inventory", listing)
+
+    with pytest.raises(UsageError, match="did you mean search") as excinfo:
+        run(load_config(root), _dummy_request())
+
+    assert asked == [{"files"}]
+    assert str(excinfo.value).startswith(
+        "trigger tools the attached mcp_servers do not serve"
+    )
+
+
+def test_a_run_warns_and_goes_on_when_a_server_cannot_be_asked(
+    tmp_path, monkeypatch, capsys
+):
+    from agent_exam.mcp import ToolInventory
+
+    root = _mcp_project(
+        tmp_path, ("t.yaml", "kind: trigger\nmcp_tool: search\npositive: [hi]\n")
+    )
+    monkeypatch.setattr(
+        "agent_exam.runner.tool_inventory",
+        lambda cfg, names, **kwargs: ToolInventory(errors={"files": "cannot reach it"}),
+    )
+
+    # The run goes ahead — the dummy harness then misses the target, which
+    # is the case's verdict, not a refusal to start.
+    run(load_config(root), _dummy_request())
+
+    assert (
+        "[WARN] mcp tool listing: files: cannot reach it; the trigger tools it may "
+        "serve were not checked" in capsys.readouterr().err
+    )
 
 
 def _graded(result: RunResult) -> bool:

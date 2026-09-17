@@ -79,6 +79,9 @@ Trigger-task fields
     An MCP tool expected to be called, or expected not to be, instead of a
     skill: a bare tool name, or a mapping with ``server`` and ``tool`` as in
     ``first_mcp_tool``. Exactly one of ``skill`` and ``mcp_tool`` is required.
+    ``doctor`` and the runner check the name against the tools the attached
+    servers list, so a tool named after its server (``notion-search`` on a
+    server called ``notion``) needs no special spelling.
 
 ``positive``
     User prompts that should fire the target.

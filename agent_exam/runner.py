@@ -21,14 +21,16 @@ from .hooks import call_pre_run_hook
 from .ids import new_run_id
 from .judge import JudgeCache, build_judge_call
 from .mcp import preflight as mcp_preflight
+from .mcp import tool_inventory
 from .pool import AttemptOutcome, PoolPlan, forget_mcp_staging, run_plan
 from .providers import get_provider
 from .providers.skill_staging import discover_skills
 from .report import AttemptReport, report_to_dict, score_attempt
+from .schemas import CheckResult
 from .scoring_context import ScoringContext
 from .serde import write_json
 from .tasks import Task, expand_specs, load_specs, load_suite_config, select_by_tags
-from .validation import validate_suite
+from .validation import check_trigger_tools, trigger_servers, validate_suite
 
 if TYPE_CHECKING:
     from .config import Config
@@ -488,6 +490,12 @@ def run(cfg: Config, req: RunRequest) -> int:
         if warning.status == "WARN":
             _emit_warning(warning)
 
+    # The tools the trigger tasks target have to exist on the servers they
+    # attach, or every positive case fails as a routing miss. Each server is
+    # asked for its tools; one that cannot be asked leaves its targets
+    # unchecked, with a warning, rather than standing in the way of the run.
+    _check_trigger_tools(cfg, tasks)
+
     _emit_run_header(
         paths.run_id, req, plan, model, effective_k, concrete, tags_excluded
     )
@@ -651,6 +659,34 @@ def _lookup_task(tasks: list[Task], suite: str, name: str) -> Task:
         if t.suite == suite and t.name == name:
             return t
     raise KeyError(f"task {suite}::{name} not found in plan")
+
+
+def _check_trigger_tools(cfg: Config, tasks: list[Task]) -> None:
+    servers = trigger_servers(cfg, tasks)
+    if not servers:
+        return
+    inventory = tool_inventory(cfg, servers)
+    for name, error in sorted(inventory.errors.items()):
+        _emit_warning(
+            CheckResult(
+                name="mcp tool listing",
+                status="WARN",
+                hint=f"{name}: {error}; the trigger tools it may serve were not checked",
+            )
+        )
+    fails = [
+        check
+        for suite in sorted({t.suite for t in tasks})
+        for check in check_trigger_tools(
+            suite, cfg, [t for t in tasks if t.suite == suite], inventory
+        )
+        if check.status == "FAIL"
+    ]
+    if fails:
+        raise UsageError(
+            "trigger tools the attached mcp_servers do not serve:\n  "
+            + "\n  ".join(f"{c.name}: {c.hint}" for c in fails)
+        )
 
 
 def _emit_warning(check) -> None:

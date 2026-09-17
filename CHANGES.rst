@@ -2,6 +2,20 @@
 Changes
 =======
 
+0.2.1 (unreleased)
+==================
+
+-   ``doctor`` and the runner now check that the tools ``kind: trigger``
+    tasks target exist, by asking each MCP server the tasks attach for its
+    tools. A target no attached server serves is a FAIL, with the closest
+    names suggested, and a run refuses to start on one; a server that cannot
+    be asked is a warning, and the targets it may serve go unchecked.
+
+    This replaces the guess from the name alone, which failed a bare
+    ``mcp_tool:`` whenever it began with an attached server's name — every
+    tool named after its server, such as ``notion-search`` on a server called
+    ``notion``, tripped it.
+
 0.2.0 (2026-08-17)
 ==================
 
