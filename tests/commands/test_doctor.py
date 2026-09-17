@@ -597,3 +597,74 @@ def test_skills_dirs_missing_is_warn_when_no_hook(tmp_path, monkeypatch):
     assert exit_code == 0
     assert statuses["skills available"] == "WARN"
     assert "skills_dirs not configured" in hints["skills available"]
+
+
+def _mcp_trigger_project(tmp_path: Path) -> Path:
+    root = _make_project(
+        tmp_path,
+        dedent(
+            """\
+            default_harness: claude_code
+            skills_dirs: []
+            mcp_servers:
+              files:
+                command: sh
+            providers:
+              claude_code:
+                judge_model: haiku
+            """
+        ),
+    )
+    tasks = root / "evals" / "suites" / "s" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "t.yaml").write_text(
+        "kind: trigger\nmcp_tool: files_search\npositive: [hi]\n"
+    )
+    return root
+
+
+def test_trigger_tools_are_checked_against_what_the_servers_list(tmp_path, monkeypatch):
+    from agent_exam.mcp import ToolInventory
+
+    root = _mcp_trigger_project(tmp_path)
+    asked: list[set[str]] = []
+
+    def listing(cfg, names, **kwargs):
+        asked.append(set(names))
+        return ToolInventory(tools={"files": frozenset({"files_search"})})
+
+    monkeypatch.setattr("agent_exam.commands.doctor.tool_inventory", listing)
+    monkeypatch.setattr("agent_exam.commands.doctor.mcp_preflight", lambda cfg, p: [])
+
+    code, results = _run(monkeypatch, root)
+
+    assert code == 0
+    assert asked == [{"files"}]
+    [check] = [r for r in results if r.name == "s: trigger tools exist"]
+    assert (check.status, check.hint) == (
+        "OK",
+        "1 target(s) found on the attached servers",
+    )
+
+
+def test_a_server_that_cannot_be_asked_is_a_warning_not_a_verdict(
+    tmp_path, monkeypatch
+):
+    from agent_exam.mcp import ToolInventory
+
+    root = _mcp_trigger_project(tmp_path)
+    monkeypatch.setattr(
+        "agent_exam.commands.doctor.tool_inventory",
+        lambda cfg, names, **kwargs: ToolInventory(errors={"files": "cannot start sh"}),
+    )
+    monkeypatch.setattr("agent_exam.commands.doctor.mcp_preflight", lambda cfg, p: [])
+
+    code, results = _run(monkeypatch, root)
+
+    assert code == 0
+    [warning] = [r for r in results if r.name == "mcp tool listings"]
+    assert warning.status == "WARN"
+    assert warning.hint == (
+        "trigger tool names not checked against: files (cannot start sh)"
+    )
+    assert not [r for r in results if r.name == "s: trigger tools exist"]

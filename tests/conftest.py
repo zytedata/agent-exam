@@ -22,6 +22,23 @@ def _fresh_oauth_tokens(monkeypatch):
     monkeypatch.setattr("agent_exam.mcp._TOKENS", {})
 
 
+@pytest.fixture(autouse=True)
+def _no_mcp_tool_listing(monkeypatch):
+    """Keep runs and doctor from asking the MCP servers tests declare for
+    their tools — a ``command: sh`` stands in for a server in most of them.
+
+    They see an empty inventory instead, which leaves every trigger target
+    unchecked. Tests of the check itself patch these names again.
+    """
+    from agent_exam.mcp import ToolInventory
+
+    def nothing_listed(cfg, names, **kwargs):
+        return ToolInventory()
+
+    monkeypatch.setattr("agent_exam.runner.tool_inventory", nothing_listed)
+    monkeypatch.setattr("agent_exam.commands.doctor.tool_inventory", nothing_listed)
+
+
 def git_init(root: Path, gitignore: str = "", commit: bool = False) -> None:
     """Make *root* a git work tree.
 

@@ -7,10 +7,12 @@ import shutil
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from .config import McpOAuth, McpStdioServer
 from .errors import UsageError
+from .mcp_client import McpClientError, list_tools
 from .oauth import expires_in, has_login, post, refresh_login
 from .schemas import CheckResult
 from .trajectory_walk import iter_tool_calls
@@ -248,6 +250,41 @@ def stage_mcp_json(run_tmp_root: Path, cfg: Config, servers: list[str] | None) -
         "mcp_config_path": render_mcp_json(run_tmp_root, resolved),
         "mcp_server_names": sorted(resolved),
     }
+
+
+@dataclass(frozen=True)
+class ToolInventory:
+    """What the servers asked say they serve, for the trigger tool checks.
+
+    ``tools`` maps each server that answered to its tool names; ``errors``
+    maps each one that could not be asked to the reason, so the checks
+    leave the targets it might serve alone and doctor can say why.
+    """
+
+    tools: dict[str, frozenset[str]] = field(default_factory=dict)
+    errors: dict[str, str] = field(default_factory=dict)
+
+
+def tool_inventory(
+    cfg: Config, names: Iterable[str], *, timeout: float = 20.0
+) -> ToolInventory:
+    """Ask each server in *names* for its tools.
+
+    Each is resolved the way the harness gets it — ``${VAR}`` expanded, an
+    OAuth token minted — and asked over its own transport. A server that
+    cannot be resolved or answered lands in ``errors`` rather than failing
+    the lot: the others' listings are still worth checking against.
+    """
+    inventory = ToolInventory()
+    for name in sorted(set(names)):
+        try:
+            (resolved,) = resolve_servers(cfg, [name]).values()
+            tools = list_tools(resolved, timeout=timeout)
+        except (UsageError, McpClientError) as exc:
+            inventory.errors[name] = str(exc)
+            continue
+        inventory.tools[name] = frozenset(tools)
+    return inventory
 
 
 _CANONICAL_PREFIX = "mcp__"

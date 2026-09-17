@@ -201,6 +201,9 @@ ignore = [
 # Fixture hygiene asks the `git` on PATH what it ignores; the arguments are
 # suite fixture names read from the eval config.
 "agent_exam/validation.py" = ["S603", "S607"]
+# The MCP client starts the stdio server command, and opens the HTTP server
+# URL, that the eval config declares — the same ones the harness is handed.
+"agent_exam/mcp_client.py" = ["S310", "S603"]
 
 [tool.ruff.lint.flake8-type-checking]
 # Pydantic and dataclasses resolve annotations at run time, so their fields

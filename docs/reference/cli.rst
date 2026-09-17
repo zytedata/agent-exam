@@ -228,6 +228,12 @@ assertion's type and config are well formed, and every referenced fixture
 exists on disk. The runner makes the same call and aborts before spending
 tokens when a suite fails it.
 
+Where trigger tasks target MCP tools, doctor asks each server the tasks attach
+for its tools and checks that every target is among them, so a misspelled
+``mcp_tool:`` shows up here rather than as every positive case failing. A
+server that cannot be asked is a warning, and the targets it may serve go
+unchecked. The runner makes the same check before it starts.
+
 If ``pre_run_hook`` is configured in :file:`pyproject.toml`, doctor invokes it
 the same way the runner does, which is what projects that build their skills on
 demand need. A "skills available" check then reports how many skills were
