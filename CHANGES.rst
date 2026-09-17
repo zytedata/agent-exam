@@ -2,6 +2,24 @@
 Changes
 =======
 
+0.3.0 (unreleased)
+==================
+
+-   Added MCP support.
+
+-   Added ``judge.provider`` and ``judge.model``, to judge a run with a
+    different harness and model than the one under evaluation.
+
+-   Ctrl+C now stops a run at once, and exits with status 130.
+
+-   Fixed runs on Windows, where the agent subprocess survived a timeout or a
+    cancellation, and where a long prompt overran the command-line length
+    limit.
+
+-   A crash while scoring an attempt no longer takes down the whole run.
+
+-   Improved the hint about skill descriptions Claude Code ignored.
+
 0.2.0 (2026-08-17)
 ==================
 
