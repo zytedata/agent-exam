@@ -83,6 +83,21 @@ def _is_tool_result_only(content: list) -> bool:
     return all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
 
 
+def _summarize_block(block: dict) -> str:
+    """Stand in for a tool result block whose payload the trajectory drops,
+    naming its type and, when known, its media type and decoded size, so a
+    judge can tell that something came back and what it was.
+    """
+    source = block.get("source")
+    source = source if isinstance(source, dict) else block
+    details = [d for d in (source.get("media_type") or source.get("mimeType"),) if d]
+    data = source.get("data")
+    if isinstance(data, str):
+        details.append(f"{len(data) * 3 // 4} bytes")
+    suffix = f": {', '.join(details)}" if details else ""
+    return f"[{block.get('type') or 'content'}{suffix}]"
+
+
 def _collect_tool_results(entries: list[dict]) -> dict[str, dict]:
     """Map tool_use_id → {result, is_error, ts}."""
     results: dict[str, dict] = {}
@@ -100,15 +115,16 @@ def _collect_tool_results(entries: list[dict]) -> dict[str, dict]:
                 continue
             content = block.get("content")
             if isinstance(content, list):
-                text_parts = []
+                parts = []
                 for b in content:
-                    if isinstance(b, dict) and b.get("type") == "text":
-                        text_parts.append(b.get("text", ""))
-                    elif isinstance(b, str):
-                        text_parts.append(b)
-                result_str = (
-                    "\n".join(text_parts) if text_parts else json.dumps(content)
-                )
+                    if isinstance(b, str):
+                        parts.append(b)
+                    elif isinstance(b, dict):
+                        if b.get("type") == "text":
+                            parts.append(b.get("text", ""))
+                        else:
+                            parts.append(_summarize_block(b))
+                result_str = "\n".join(parts) if parts else json.dumps(content)
             elif isinstance(content, str):
                 result_str = content
             else:
