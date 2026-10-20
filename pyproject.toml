@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-exam"
-version = "0.2.0"
+version = "0.3.0"
 description = "Eval framework for agent skills, across Claude Code, Codex CLI, Copilot CLI and OpenCode"
 readme = "README.md"
 license = "Apache-2.0"
