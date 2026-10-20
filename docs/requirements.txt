@@ -53,7 +53,7 @@ sphinx-markdown-builder @ git+https://github.com/zytedata/sphinx-markdown-builde
     # via sphinx-scrapy
 sphinx-rtd-theme==3.1.0
     # via -r requirements.in
-sphinx-scrapy @ git+https://github.com/scrapy/sphinx-scrapy.git@fe176adc1a8577601bc3fa39b590ebed71a7e9b8
+sphinx-scrapy @ git+https://github.com/scrapy/sphinx-scrapy.git@0.8.10
     # via -r requirements.in
 sphinx-sitemap==2.9.0
     # via sphinx-scrapy
@@ -73,5 +73,5 @@ sphinxcontrib-serializinghtml==2.0.0
     # via sphinx
 tabulate==0.10.0
     # via sphinx-markdown-builder
-urllib3==2.7.0
+urllib3==2.8.0
     # via requests
