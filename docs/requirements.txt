@@ -4,7 +4,7 @@ alabaster==1.0.0
     # via sphinx
 babel==2.18.0
     # via sphinx
-certifi==2026.7.22
+certifi==2026.10.18
     # via requests
 charset-normalizer==3.4.9
     # via requests
@@ -15,7 +15,7 @@ docutils==0.22.4
     #   sphinx-rtd-theme
 idna==3.18
     # via requests
-imagesize==2.0.0
+imagesize==2.0.1
     # via sphinx
 jinja2==3.1.6
     # via sphinx
